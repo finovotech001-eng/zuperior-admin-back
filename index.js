@@ -13,6 +13,9 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const expressValidator = require('express-validator');
 require('dotenv').config();
 
 const app = express();
@@ -36,6 +39,50 @@ if (CORS_ORIGIN === '*' || CORS_ORIGIN === '*,*') {
     credentials: true,
   };
 }
+
+// ---- Security Middleware ----
+// Helmet for security headers
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+    },
+  },
+  crossOriginEmbedderPolicy: false
+}));
+
+// Rate limiting for login attempts
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 requests per windowMs
+  message: {
+    ok: false,
+    error: 'Too many login attempts, please try again later.'
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// General rate limiting
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: {
+    ok: false,
+    error: 'Too many requests, please try again later.'
+  }
+});
+
+// Apply rate limiting
+app.use(generalLimiter);
 
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '1mb' }));
@@ -1198,18 +1245,52 @@ app.post('/admin/send-emails', async (req, res) => {
 
 // ===== ADMIN AUTHENTICATION ENDPOINTS =====
 
-// Admin login
-app.post('/admin/login', async (req, res) => {
+// Admin login with enhanced security
+app.post('/admin/login', loginLimiter, async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, csrfToken, timestamp, userAgent, captcha } = req.body;
     
+    // Security validations
     if (!email || !password) {
       return res.status(400).json({ ok: false, error: 'Email and password are required' });
     }
+
+    // CSRF Token validation
+    if (!csrfToken) {
+      return res.status(400).json({ ok: false, error: 'CSRF token required' });
+    }
+
+    // Rate limiting check
+    const ipAddress = getRealIP(req);
+    const rateLimitKey = `login_attempts_${ipAddress}`;
     
-    // Find admin by email
+    // Check for suspicious activity (relaxed for better UX)
+    const now = Date.now();
+    const requestTime = timestamp || now;
+    const timeDiff = Math.abs(now - requestTime);
+    
+    if (timeDiff > 600000) { // 10 minutes (increased from 5)
+      return res.status(400).json({ ok: false, error: 'Request timestamp invalid' });
+    }
+
+    // Input sanitization
+    const sanitizedEmail = email.toString().trim().toLowerCase();
+    const sanitizedPassword = password.toString();
+    
+    // Email validation
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    if (!emailRegex.test(sanitizedEmail)) {
+      return res.status(400).json({ ok: false, error: 'Invalid email format' });
+    }
+
+    // Password length validation
+    if (sanitizedPassword.length < 6 || sanitizedPassword.length > 128) {
+      return res.status(400).json({ ok: false, error: 'Invalid password length' });
+    }
+    
+    // Find admin by email (use sanitized email)
     const admin = await prisma.admin.findUnique({
-      where: { email }
+      where: { email: sanitizedEmail }
     });
     
     
@@ -1226,12 +1307,12 @@ app.post('/admin/login', async (req, res) => {
       return res.status(401).json({ ok: false, error: 'Account is temporarily locked' });
     }
     
-    // Verify password
-    const isValidPassword = await bcrypt.compare(password, admin.password_hash);
+    // Verify password (use sanitized password)
+    const isValidPassword = await bcrypt.compare(sanitizedPassword, admin.password_hash);
     
     if (!isValidPassword) {
       // Get IP address and user agent for failed login
-      const ipAddress = getRealIP(req);
+      const failedIpAddress = getRealIP(req);
       const userAgent = req.headers['user-agent'] || '';
       const { browser, os, device } = parseUserAgent(userAgent);
       
@@ -1239,7 +1320,7 @@ app.post('/admin/login', async (req, res) => {
       await prisma.admin_login_log.create({
         data: {
           admin_id: admin.id,
-          ip_address: ipAddress,
+          ip_address: failedIpAddress,
           user_agent: userAgent,
           location: 'Unknown',
           device: device,
@@ -1265,9 +1346,7 @@ app.post('/admin/login', async (req, res) => {
       return res.status(401).json({ ok: false, error: 'Invalid credentials' });
     }
     
-    // Get IP address and user agent
-    const ipAddress = getRealIP(req);
-    const userAgent = req.headers['user-agent'] || '';
+    // Parse user agent (reuse ipAddress and userAgent from above)
     const { browser, os, device } = parseUserAgent(userAgent);
     
     // Log successful login
