@@ -323,7 +323,6 @@ model admin {
   
   // Relations
   login_logs     admin_login_log[]
-  balance_operations balance_operation_history[]
 }
 
 model admin_login_log {
@@ -435,27 +434,4 @@ model symbols {
   swap3_day     String?   @default("wednesday") @db.VarChar(10)
   created_at    DateTime? @default(now()) @db.Timestamp(6)
   updated_at    DateTime? @default(now()) @db.Timestamp(6)
-}
-
-model balance_operation_history {
-  id              Int      @id @default(autoincrement())
-  admin_id        Int
-  mt5_login       String   @db.VarChar(50)
-  operation_type  String   @db.VarChar(50)
-  amount          Float
-  currency        String   @default("USD") @db.VarChar(10)
-  description     String?  @db.Text
-  status          String   @default("completed") @db.VarChar(20)
-  error_message   String?  @db.Text
-  ip_address      String?  @db.VarChar(45)
-  user_agent      String?  @db.Text
-  created_at      DateTime @default(now()) @db.Timestamptz(6)
-  
-  // Relations
-  admin           admin    @relation(fields: [admin_id], references: [id], onDelete: Cascade)
-  
-  @@index([admin_id])
-  @@index([created_at])
-  @@index([mt5_login])
-  @@index([operation_type])
 }

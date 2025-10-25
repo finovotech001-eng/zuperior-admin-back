@@ -2507,6 +2507,41 @@ app.get('/admin/mt5/balance-history', authenticateAdmin, async (req, res) => {
   }
 });
 
+// MT5 API Proxy endpoint
+app.get('/admin/mt5/account/:accountId', authenticateAdmin, async (req, res) => {
+  try {
+    const { accountId } = req.params;
+    
+    // Call the MT5 API
+    const response = await fetch(`http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`, {
+      method: 'GET',
+      headers: {
+        'accept': '*/*'
+      }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`MT5 API returned ${response.status}: ${response.statusText}`);
+    }
+    
+    const data = await response.json();
+    
+    // Return the data in the expected format
+    res.json({
+      ok: true,
+      account: data.Data,
+      message: data.Message
+    });
+    
+  } catch (error) {
+    console.error('MT5 API proxy error:', error);
+    res.status(500).json({
+      ok: false,
+      error: `Failed to fetch MT5 account data: ${error.message}`
+    });
+  }
+});
+
 app.listen(PORT, async () => {
   console.log(`zuperior-admin-back listening on :${PORT}`);
   await createDefaultAdmin();
