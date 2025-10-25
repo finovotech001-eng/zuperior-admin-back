@@ -308,6 +308,74 @@ model group_commission_structures {
   @@unique([group_id, structure_name])
 }
 
+model admin {
+  id             Int       @id @default(autoincrement())
+  username       String    @unique @db.VarChar(255)
+  email          String    @unique @db.VarChar(255)
+  password_hash  String    @db.VarChar(255)
+  admin_role     String?   @default("admin") @db.VarChar(50)
+  is_active      Boolean?  @default(true)
+  last_login     DateTime? @db.Timestamptz(6)
+  login_attempts Int?      @default(0)
+  locked_until   DateTime? @db.Timestamptz(6)
+  created_at     DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime? @default(now()) @db.Timestamptz(6)
+  
+  // Relations
+  login_logs     admin_login_log[]
+}
+
+model admin_login_log {
+  id          Int      @id @default(autoincrement())
+  admin_id    Int
+  ip_address  String   @db.VarChar(45)  // IPv6 max length
+  user_agent  String?  @db.Text
+  location    String?  @db.VarChar(255)
+  device      String?  @db.VarChar(255)
+  browser     String?  @db.VarChar(255)
+  os          String?  @db.VarChar(255)
+  success     Boolean  @default(true)
+  failure_reason String? @db.VarChar(255)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  
+  // Relations
+  admin       admin    @relation(fields: [admin_id], references: [id], onDelete: Cascade)
+  
+  @@index([admin_id])
+  @@index([created_at])
+}
+
+model payment_gateway {
+  id                    Int      @id @default(autoincrement())
+  wallet_name           String   @db.VarChar(255)
+  deposit_wallet_address String  @db.VarChar(255)
+  api_key               String   @db.Text
+  secret_key            String   @db.Text
+  gateway_type          String   @db.VarChar(50)  // crypto, fiat, bank, card
+  is_active             Boolean  @default(true)
+  description           String?  @db.Text
+  created_at            DateTime @default(now()) @db.Timestamptz(6)
+  updated_at            DateTime @updatedAt @db.Timestamptz(6)
+  
+  @@index([gateway_type])
+  @@index([is_active])
+}
+
+model manual_gateway {
+  id          Int      @id @default(autoincrement())
+  type        String   @db.VarChar(50)  // crypto, wire, upi, local
+  name        String   @db.VarChar(255)
+  details     String   @db.Text
+  icon_url    String?  @db.VarChar(500)
+  qr_code_url String?  @db.VarChar(500)
+  is_active   Boolean  @default(true)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime @updatedAt @db.Timestamptz(6)
+  
+  @@index([type])
+  @@index([is_active])
+}
+
 model ib_admin {
   id             Int       @id @default(autoincrement())
   email          String    @unique @db.VarChar(255)

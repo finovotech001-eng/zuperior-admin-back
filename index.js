@@ -4,7 +4,6 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios'); // eslint-disable-line no-unused-vars
-const jwt = require('jsonwebtoken'); // eslint-disable-line no-unused-vars
 const { Pool } = require('pg');
 const { PrismaClient } = require('@prisma/client');
 const multer = require('multer');
@@ -13,6 +12,7 @@ const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
@@ -65,6 +65,53 @@ const emailTransporter = nodemailer.createTransport({
     pass: process.env.SMTP_PASS,
   },
 });
+
+// ---- Authentication Middleware ----
+const authenticateAdmin = async (req, res, next) => {
+  try {
+    console.log('🔐 Auth attempt:', {
+      url: req.url,
+      method: req.method,
+      authHeader: req.headers.authorization,
+      userAgent: req.headers['user-agent']?.substring(0, 50)
+    });
+    
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token) {
+      console.log('❌ No token provided');
+      return res.status(401).json({ ok: false, error: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    
+    const admin = await prisma.admin.findUnique({
+      where: { id: decoded.adminId },
+      select: {
+        id: true,
+        email: true,
+        admin_role: true,
+        is_active: true,
+        last_login: true
+      }
+    });
+
+    if (!admin) {
+      return res.status(401).json({ ok: false, error: 'Admin not found' });
+    }
+
+    if (!admin.is_active) {
+      return res.status(401).json({ ok: false, error: 'Account is inactive' });
+    }
+
+    req.adminId = admin.id;
+    req.admin = admin;
+    next();
+  } catch (err) {
+    console.error('Authentication failed:', err);
+    res.status(401).json({ ok: false, error: 'Invalid token' });
+  }
+};
 
 // ---- Routes ----
 app.get('/health', (req, res) => {
@@ -132,7 +179,7 @@ app.delete('/admin/users/:id', async (req, res) => {
 
 // -------- KYC endpoints --------
 // List KYC records with user info
-app.get('/admin/kyc', async (req, res) => {
+app.get('/admin/kyc', authenticateAdmin, async (req, res) => {
   try {
     const take = Math.min(parseInt(req.query.limit || '100', 10), 500);
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
@@ -227,7 +274,7 @@ app.post('/admin/uploads', upload.fields([{ name: 'document', maxCount: 1 }, { n
 });
 
 // Fetch all users (paginated)
-app.get('/admin/users/all', async (req, res) => {
+app.get('/admin/users/all', authenticateAdmin, async (req, res) => {
   try {
     const take = Math.min(parseInt(req.query.limit || '100', 10), 500);
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
@@ -401,7 +448,7 @@ app.get('/admin/mt5/account/:accountId', async (req, res) => {
 });
 
 // Fetch all MT5 users with balances
-app.get('/admin/mt5/users', async (req, res) => {
+app.get('/admin/mt5/users', authenticateAdmin, async (req, res) => {
   try {
     const take = Math.min(parseInt(req.query.limit || '100', 10), 500);
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
@@ -541,7 +588,7 @@ app.post('/admin/mt5/assign', async (req, res) => {
 });
 
 // List deposits by status
-app.get('/admin/deposits', async (req, res) => {
+app.get('/admin/deposits', authenticateAdmin, async (req, res) => {
   try {
     const status = req.query.status;
     const take = Math.min(parseInt(req.query.limit || '100', 10), 500);
@@ -577,7 +624,7 @@ app.get('/admin/deposits', async (req, res) => {
 });
 
 // List withdrawals by status
-app.get('/admin/withdrawals', async (req, res) => {
+app.get('/admin/withdrawals', authenticateAdmin, async (req, res) => {
   try {
     const status = req.query.status;
     const take = Math.min(parseInt(req.query.limit || '100', 10), 10000);
@@ -1149,6 +1196,677 @@ app.post('/admin/send-emails', async (req, res) => {
   }
 });
 
+// ===== ADMIN AUTHENTICATION ENDPOINTS =====
+
+// Admin login
+app.post('/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ ok: false, error: 'Email and password are required' });
+    }
+    
+    // Find admin by email
+    const admin = await prisma.admin.findUnique({
+      where: { email }
+    });
+    
+    
+    if (!admin) {
+      return res.status(401).json({ ok: false, error: 'Invalid credentials' });
+    }
+    
+    if (!admin.is_active) {
+      return res.status(401).json({ ok: false, error: 'Account is deactivated' });
+    }
+    
+    // Check if account is locked
+    if (admin.locked_until && new Date() < admin.locked_until) {
+      return res.status(401).json({ ok: false, error: 'Account is temporarily locked' });
+    }
+    
+    // Verify password
+    const isValidPassword = await bcrypt.compare(password, admin.password_hash);
+    
+    if (!isValidPassword) {
+      // Get IP address and user agent for failed login
+      const ipAddress = getRealIP(req);
+      const userAgent = req.headers['user-agent'] || '';
+      const { browser, os, device } = parseUserAgent(userAgent);
+      
+      // Log failed login attempt
+      await prisma.admin_login_log.create({
+        data: {
+          admin_id: admin.id,
+          ip_address: ipAddress,
+          user_agent: userAgent,
+          location: 'Unknown',
+          device: device,
+          browser: browser,
+          os: os,
+          success: false,
+          failure_reason: 'Invalid password'
+        }
+      });
+      
+      // Increment login attempts
+      const newAttempts = (admin.login_attempts || 0) + 1;
+      const lockUntil = newAttempts >= 5 ? new Date(Date.now() + 15 * 60 * 1000) : null; // Lock for 15 minutes
+      
+      await prisma.admin.update({
+        where: { id: admin.id },
+        data: {
+          login_attempts: newAttempts,
+          locked_until: lockUntil
+        }
+      });
+      
+      return res.status(401).json({ ok: false, error: 'Invalid credentials' });
+    }
+    
+    // Get IP address and user agent
+    const ipAddress = getRealIP(req);
+    const userAgent = req.headers['user-agent'] || '';
+    const { browser, os, device } = parseUserAgent(userAgent);
+    
+    // Log successful login
+    await prisma.admin_login_log.create({
+      data: {
+        admin_id: admin.id,
+        ip_address: ipAddress,
+        user_agent: userAgent,
+        location: 'Unknown', // You can integrate with IP geolocation service
+        device: device,
+        browser: browser,
+        os: os,
+        success: true
+      }
+    });
+    
+    // Reset login attempts on successful login
+    await prisma.admin.update({
+      where: { id: admin.id },
+      data: {
+        login_attempts: 0,
+        locked_until: null,
+        last_login: new Date()
+      }
+    });
+    
+    // Generate JWT token
+    const token = jwt.sign(
+      { 
+        adminId: admin.id, 
+        email: admin.email,
+        role: admin.admin_role 
+      },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '24h' }
+    );
+    
+    res.json({
+      ok: true,
+      token,
+      admin: {
+        id: admin.id,
+        email: admin.email,
+        role: admin.admin_role,
+        last_login: admin.last_login
+      }
+    });
+  } catch (err) {
+    console.error('POST /admin/login failed:', err);
+    res.status(500).json({ ok: false, error: 'Login failed' });
+  }
+});
+
+// Admin logout
+app.post('/admin/logout', async (req, res) => {
+  try {
+    // In a real app, you might want to blacklist the token
+    res.json({ ok: true, message: 'Logged out successfully' });
+  } catch (err) {
+    console.error('POST /admin/logout failed:', err);
+    res.status(500).json({ ok: false, error: 'Logout failed' });
+  }
+});
+
+// Verify admin token
+app.get('/admin/verify', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(401).json({ ok: false, error: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    
+    const admin = await prisma.admin.findUnique({
+      where: { id: decoded.adminId },
+      select: {
+        id: true,
+        email: true,
+        admin_role: true,
+        is_active: true,
+        last_login: true
+      }
+    });
+    
+    if (!admin || !admin.is_active) {
+      return res.status(401).json({ ok: false, error: 'Invalid token' });
+    }
+    
+    res.json({
+      ok: true,
+      admin
+    });
+  } catch (err) {
+    console.error('GET /admin/verify failed:', err);
+    res.status(401).json({ ok: false, error: 'Invalid token' });
+  }
+});
+
+// Create default admin (for initial setup)
+// Test database connection
+app.get('/admin/test-db', async (req, res) => {
+  try {
+    const adminCount = await prisma.admin.count();
+    const admin = await prisma.admin.findFirst();
+    res.json({ ok: true, adminCount, admin: admin ? { email: admin.email, role: admin.admin_role, is_active: admin.is_active } : null });
+  } catch (err) {
+    console.error('Database test failed:', err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// Get all admins
+app.get('/admin/admins', async (req, res) => {
+  try {
+    const admins = await prisma.admin.findMany({
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        admin_role: true,
+        is_active: true,
+        last_login: true,
+        created_at: true
+      }
+    });
+    res.json({ ok: true, admins });
+  } catch (err) {
+    console.error('GET /admin/admins failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch admins' });
+  }
+});
+
+// Update admin role
+app.put('/admin/admins/:id/role', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { admin_role } = req.body;
+    
+    if (!admin_role) {
+      return res.status(400).json({ ok: false, error: 'Role is required' });
+    }
+    
+    const admin = await prisma.admin.update({
+      where: { id: parseInt(id) },
+      data: { admin_role },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        admin_role: true,
+        is_active: true
+      }
+    });
+    
+    res.json({ ok: true, admin });
+  } catch (err) {
+    console.error('PUT /admin/admins/:id/role failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to update admin role' });
+  }
+});
+
+// Create new admin
+app.post('/admin/admins', async (req, res) => {
+  try {
+    const { username, email, password, admin_role } = req.body;
+    
+    if (!username || !email || !password || !admin_role) {
+      return res.status(400).json({ ok: false, error: 'All fields are required' });
+    }
+    
+    // Check if email already exists
+    const existingAdmin = await prisma.admin.findUnique({
+      where: { email }
+    });
+    
+    if (existingAdmin) {
+      return res.status(400).json({ ok: false, error: 'Email already exists' });
+    }
+    
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    const admin = await prisma.admin.create({
+      data: {
+        username,
+        email,
+        password_hash: hashedPassword,
+        admin_role,
+        is_active: true
+      },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        admin_role: true,
+        is_active: true,
+        created_at: true
+      }
+    });
+    
+    res.json({ ok: true, admin });
+  } catch (err) {
+    console.error('POST /admin/admins failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to create admin' });
+  }
+});
+
+app.post('/admin/setup', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+      return res.status(400).json({ ok: false, error: 'Email and password are required' });
+    }
+    
+    // Check if any admin exists
+    const existingAdmin = await prisma.admin.findFirst();
+    if (existingAdmin) {
+      return res.status(400).json({ ok: false, error: 'Admin already exists' });
+    }
+    
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    const admin = await prisma.admin.create({
+      data: {
+        username: email.split('@')[0], // Use email prefix as username
+        email,
+        password_hash: hashedPassword,
+        admin_role: 'superadmin',
+        is_active: true
+      }
+    });
+    
+    res.json({
+      ok: true,
+      message: 'Default admin created successfully',
+      admin: {
+        id: admin.id,
+        email: admin.email,
+        role: admin.admin_role
+      }
+    });
+  } catch (err) {
+    console.error('POST /admin/setup failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to create admin' });
+  }
+});
+
+// ---- Helper function to get real IP address ----
+const getRealIP = (req) => {
+  return req.headers['x-forwarded-for'] || 
+         req.headers['x-real-ip'] || 
+         req.connection.remoteAddress || 
+         req.socket.remoteAddress ||
+         (req.connection.socket ? req.connection.socket.remoteAddress : null) ||
+         req.ip ||
+         '127.0.0.1';
+};
+
+// ---- Helper function to parse user agent ----
+const parseUserAgent = (userAgent) => {
+  if (!userAgent) return { browser: 'Unknown', os: 'Unknown', device: 'Unknown' };
+  
+  const browser = userAgent.includes('Chrome') ? 'Chrome' :
+                  userAgent.includes('Firefox') ? 'Firefox' :
+                  userAgent.includes('Safari') ? 'Safari' :
+                  userAgent.includes('Edge') ? 'Edge' : 'Unknown';
+  
+  const os = userAgent.includes('Windows') ? 'Windows' :
+             userAgent.includes('Mac') ? 'macOS' :
+             userAgent.includes('Linux') ? 'Linux' :
+             userAgent.includes('Android') ? 'Android' :
+             userAgent.includes('iOS') ? 'iOS' : 'Unknown';
+  
+  const device = userAgent.includes('Mobile') ? 'Mobile' :
+                 userAgent.includes('Tablet') ? 'Tablet' : 'Desktop';
+  
+  return { browser, os, device };
+};
+
+// ---- Admin Profile Endpoints ----
+app.get('/admin/profile', authenticateAdmin, async (req, res) => {
+  try {
+    const admin = await prisma.admin.findUnique({
+      where: { id: req.adminId },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        admin_role: true,
+        is_active: true,
+        last_login: true,
+        login_attempts: true,
+        locked_until: true,
+        created_at: true,
+        updated_at: true
+      }
+    });
+
+    if (!admin) {
+      return res.status(404).json({ ok: false, error: 'Admin not found' });
+    }
+
+    res.json({ ok: true, profile: admin });
+  } catch (err) {
+    console.error('GET /admin/profile failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch profile' });
+  }
+});
+
+app.put('/admin/profile', authenticateAdmin, async (req, res) => {
+  try {
+    const { username, email, currentPassword, newPassword } = req.body;
+    
+    // Get current admin
+    const currentAdmin = await prisma.admin.findUnique({
+      where: { id: req.adminId }
+    });
+
+    if (!currentAdmin) {
+      return res.status(404).json({ ok: false, error: 'Admin not found' });
+    }
+
+    // Verify current password if changing password
+    if (newPassword && currentPassword) {
+      const isCurrentPasswordValid = await bcrypt.compare(currentPassword, currentAdmin.password_hash);
+      if (!isCurrentPasswordValid) {
+        return res.status(400).json({ ok: false, error: 'Current password is incorrect' });
+      }
+    }
+
+    // Prepare update data
+    const updateData = {
+      username,
+      email,
+      updated_at: new Date()
+    };
+
+    // Hash new password if provided
+    if (newPassword) {
+      updateData.password_hash = await bcrypt.hash(newPassword, 10);
+      updateData.password_changed_at = new Date();
+    }
+
+    // Update admin
+    const updatedAdmin = await prisma.admin.update({
+      where: { id: req.adminId },
+      data: updateData,
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        admin_role: true,
+        is_active: true,
+        last_login: true,
+        login_attempts: true,
+        locked_until: true,
+        created_at: true,
+        updated_at: true
+      }
+    });
+
+    res.json({ ok: true, profile: updatedAdmin });
+  } catch (err) {
+    console.error('PUT /admin/profile failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to update profile' });
+  }
+});
+
+app.get('/admin/login-history', authenticateAdmin, async (req, res) => {
+  try {
+    // Fetch real login history from database
+    const loginLogs = await prisma.admin_login_log.findMany({
+      where: {
+        admin_id: req.adminId
+      },
+      orderBy: {
+        created_at: 'desc'
+      },
+      take: 50 // Last 50 login attempts
+    });
+
+    // Format the data for frontend
+    const history = loginLogs.map(log => ({
+      timestamp: log.created_at.toISOString(),
+      ip_address: log.ip_address,
+      location: log.location || 'Unknown',
+      device: `${log.browser} on ${log.os}`,
+      browser: log.browser,
+      os: log.os,
+      success: log.success,
+      failure_reason: log.failure_reason
+    }));
+
+    res.json({ ok: true, history });
+  } catch (err) {
+    console.error('GET /admin/login-history failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch login history' });
+  }
+});
+
+// ---- Payment Gateways Endpoints ----
+app.get('/admin/payment-gateways', authenticateAdmin, async (req, res) => {
+  try {
+    const gateways = await prisma.payment_gateway.findMany({
+      orderBy: {
+        created_at: 'desc'
+      }
+    });
+
+    res.json({ ok: true, gateways });
+  } catch (err) {
+    console.error('GET /admin/payment-gateways failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch payment gateways' });
+  }
+});
+
+app.post('/admin/payment-gateways', authenticateAdmin, async (req, res) => {
+  try {
+    const { wallet_name, deposit_wallet_address, api_key, secret_key, gateway_type, is_active, description } = req.body;
+    
+    const gateway = await prisma.payment_gateway.create({
+      data: {
+        wallet_name,
+        deposit_wallet_address,
+        api_key,
+        secret_key,
+        gateway_type,
+        is_active,
+        description
+      }
+    });
+
+    res.json({ ok: true, gateway });
+  } catch (err) {
+    console.error('POST /admin/payment-gateways failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to create payment gateway' });
+  }
+});
+
+app.put('/admin/payment-gateways/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { wallet_name, deposit_wallet_address, api_key, secret_key, gateway_type, is_active, description } = req.body;
+    
+    const gateway = await prisma.payment_gateway.update({
+      where: { id: parseInt(id) },
+      data: {
+        wallet_name,
+        deposit_wallet_address,
+        api_key,
+        secret_key,
+        gateway_type,
+        is_active,
+        description
+      }
+    });
+
+    res.json({ ok: true, gateway });
+  } catch (err) {
+    console.error('PUT /admin/payment-gateways/:id failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to update payment gateway' });
+  }
+});
+
+app.delete('/admin/payment-gateways/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    await prisma.payment_gateway.delete({
+      where: { id: parseInt(id) }
+    });
+
+    res.json({ ok: true, message: 'Payment gateway deleted successfully' });
+  } catch (err) {
+    console.error('DELETE /admin/payment-gateways/:id failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to delete payment gateway' });
+  }
+});
+
+// Change admin password
+app.put('/admin/admins/:id/password', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { newPassword } = req.body;
+    
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ ok: false, error: 'Password must be at least 6 characters' });
+    }
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    
+    const admin = await prisma.admin.update({
+      where: { id: parseInt(id) },
+      data: { password_hash: hashedPassword },
+      select: {
+        id: true,
+        username: true,
+        email: true,
+        admin_role: true,
+        is_active: true,
+        last_login: true,
+        created_at: true,
+        updated_at: true
+      }
+    });
+
+    res.json({ ok: true, admin });
+  } catch (err) {
+    console.error('PUT /admin/admins/:id/password failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to update password' });
+  }
+});
+
+// ---- Manual Gateways Endpoints ----
+app.get('/admin/manual-gateways', authenticateAdmin, async (req, res) => {
+  try {
+    const gateways = await prisma.manual_gateway.findMany({
+      orderBy: {
+        created_at: 'desc'
+      }
+    });
+
+    res.json({ ok: true, gateways });
+  } catch (err) {
+    console.error('GET /admin/manual-gateways failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch manual gateways' });
+  }
+});
+
+app.post('/admin/manual-gateways', authenticateAdmin, async (req, res) => {
+  try {
+    const { type, name, details, is_active } = req.body;
+    
+    // Handle file uploads
+    const icon_url = req.files?.icon ? `/uploads/${req.files.icon[0].filename}` : null;
+    const qr_code_url = req.files?.qr_code ? `/uploads/${req.files.qr_code[0].filename}` : null;
+    
+    const gateway = await prisma.manual_gateway.create({
+      data: {
+        type,
+        name,
+        details,
+        icon_url,
+        qr_code_url,
+        is_active
+      }
+    });
+
+    res.json({ ok: true, gateway });
+  } catch (err) {
+    console.error('POST /admin/manual-gateways failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to create manual gateway' });
+  }
+});
+
+app.put('/admin/manual-gateways/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { type, name, details, is_active } = req.body;
+    
+    // Handle file uploads
+    const updateData = { type, name, details, is_active };
+    
+    if (req.files?.icon) {
+      updateData.icon_url = `/uploads/${req.files.icon[0].filename}`;
+    }
+    if (req.files?.qr_code) {
+      updateData.qr_code_url = `/uploads/${req.files.qr_code[0].filename}`;
+    }
+    
+    const gateway = await prisma.manual_gateway.update({
+      where: { id: parseInt(id) },
+      data: updateData
+    });
+
+    res.json({ ok: true, gateway });
+  } catch (err) {
+    console.error('PUT /admin/manual-gateways/:id failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to update manual gateway' });
+  }
+});
+
+app.delete('/admin/manual-gateways/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    await prisma.manual_gateway.delete({
+      where: { id: parseInt(id) }
+    });
+
+    res.json({ ok: true, message: 'Manual gateway deleted successfully' });
+  } catch (err) {
+    console.error('DELETE /admin/manual-gateways/:id failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to delete manual gateway' });
+  }
+});
+
 // ---- Error handler ----
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
@@ -1156,6 +1874,41 @@ app.use((err, req, res, next) => {
   res.status(500).json({ ok: false, error: 'Internal Server Error' });
 });
 
-app.listen(PORT, () => {
+// Create default admin if none exists
+async function createDefaultAdmin() {
+  try {
+    const existingAdmin = await prisma.admin.findFirst();
+    if (!existingAdmin) {
+      const hashedPassword = await bcrypt.hash('Admin@000', 10);
+      await prisma.admin.create({
+        data: {
+          username: 'admin',
+          email: 'admin@zuperior.com',
+          password_hash: hashedPassword,
+          admin_role: 'superadmin',
+          is_active: true
+        }
+      });
+      console.log('✅ Default admin created: admin@zuperior.com');
+    } else {
+      // Reset password for existing admin
+      const hashedPassword = await bcrypt.hash('Admin@000', 10);
+      await prisma.admin.update({
+        where: { email: 'admin@zuperior.com' },
+        data: {
+          password_hash: hashedPassword,
+          login_attempts: 0,
+          locked_until: null
+        }
+      });
+      console.log('✅ Default admin password reset: admin@zuperior.com');
+    }
+  } catch (err) {
+    console.error('❌ Failed to create/reset default admin:', err);
+  }
+}
+
+app.listen(PORT, async () => {
   console.log(`zuperior-admin-back listening on :${PORT}`);
+  await createDefaultAdmin();
 });
