@@ -556,28 +556,104 @@ app.get('/admin/mt5/users', authenticateAdmin, async (req, res) => {
       }),
     ]);
 
-    // Fetch balances for each user's MT5 accounts
+
+    // Fetch full MT5 account details for each user
     const MT5_API_BASE = 'http://18.130.5.209:5003/api/Users';
     const items = await Promise.all(
       users.map(async (user) => {
-        const totalBalance = await Promise.all(
+        const accountDetails = await Promise.all(
           user.MT5Account.map(async (account) => {
             try {
               const response = await axios.get(`${MT5_API_BASE}/${account.accountId}/getClientProfile`, {
                 timeout: 5000,
               });
-              return response.data?.Data?.Balance || 0;
+              const mt5Response = response.data;
+              
+              // Check if MT5 API call was successful
+              if (mt5Response?.Success === true && mt5Response?.Data) {
+                const data = mt5Response.Data;
+                const accountData = {
+                  id: account.id,
+                  accountId: account.accountId,
+                  name: (data.Name && data.Name.trim() !== "") ? data.Name : "-",
+                  group: (data.Group && data.Group.trim() !== "") ? data.Group : "-",
+                  balance: data.Balance || 0,
+                  equity: data.Equity || 0,
+                  leverage: data.Leverage ? data.Leverage.toString() : "-",
+                  credit: data.Credit || 0,
+                  margin: data.Margin || 0,
+                  marginFree: data.MarginFree || 0,
+                  marginLevel: data.MarginLevel || 0,
+                  profit: data.Profit || 0,
+                  comment: (data.Comment && data.Comment.trim() !== "") ? data.Comment : "-",
+                  city: (data.City && data.City.trim() !== "") ? data.City : "-",
+                  state: (data.State && data.State.trim() !== "") ? data.State : "-",
+                  zipCode: (data.ZipCode && data.ZipCode.trim() !== "") ? data.ZipCode : "-",
+                  address: (data.Address && data.Address.trim() !== "") ? data.Address : "-",
+                  registration: (data.Registration && data.Registration.trim() !== "") ? data.Registration : "-",
+                  lastAccess: (data.LastAccess && data.LastAccess.trim() !== "") ? data.LastAccess : "-",
+                  lastIP: (data.LastIP && data.LastIP.trim() !== "") ? data.LastIP : "-",
+                };
+                return accountData;
+              } else {
+                console.warn(`⚠️ MT5 API call failed for account ${account.accountId}. Success: ${mt5Response?.Success}, Message: ${mt5Response?.Message}`);
+                return {
+                  id: account.id,
+                  accountId: account.accountId,
+                  name: "-",
+                  group: "-",
+                  balance: 0,
+                  equity: 0,
+                  leverage: "-",
+                  credit: 0,
+                  margin: 0,
+                  marginFree: 0,
+                  marginLevel: 0,
+                  profit: 0,
+                  comment: "-",
+                  city: "-",
+                  state: "-",
+                  zipCode: "-",
+                  address: "-",
+                  registration: "-",
+                  lastAccess: "-",
+                  lastIP: "-",
+                };
+              }
             } catch (error) {
-              console.warn(`Failed to fetch balance for account ${account.accountId}:`, error.message);
-              return 0;
+              console.warn(`Failed to fetch details for account ${account.accountId}:`, error.message);
+              return {
+                id: account.id,
+                accountId: account.accountId,
+                name: "-",
+                group: "-",
+                balance: 0,
+                equity: 0,
+                leverage: "-",
+                credit: 0,
+                margin: 0,
+                marginFree: 0,
+                marginLevel: 0,
+                profit: 0,
+                comment: "-",
+                city: "-",
+                state: "-",
+                zipCode: "-",
+                address: "-",
+                registration: "-",
+                lastAccess: "-",
+                lastIP: "-",
+              };
             }
           })
-        ).then(balances => balances.reduce((sum, balance) => sum + balance, 0));
+        );
+
+        const totalBalance = accountDetails.reduce((sum, account) => sum + account.balance, 0);
 
         return {
           ...user,
           totalBalance,
-          MT5Account: user.MT5Account,
+          MT5Account: accountDetails,
         };
       })
     );
@@ -2115,104 +2191,52 @@ app.get('/admin/mt5/account/:login', authenticateAdmin, async (req, res) => {
   try {
     const { login } = req.params;
     
-    // Call the real MT5 API to get account info
-    const mt5ApiUrl = process.env.MT5_API_URL || 'http://localhost:8080'; // Your MT5 API URL
-    const mt5ApiKey = process.env.MT5_API_KEY || 'your-mt5-api-key';
+    // Use the same MT5 API URL as the MT5 Users endpoint
+    const MT5_API_BASE = 'http://18.130.5.209:5003/api/Users';
     
-    console.log('🔍 Calling MT5 API:', `${mt5ApiUrl}/api/Users/${login}/getClientProfile`);
-    console.log('🔑 Using API Key:', mt5ApiKey);
+    console.log(`🔍 Fetching MT5 account info for login: ${login}`);
     
     try {
-      const response = await fetch(`${mt5ApiUrl}/api/Users/${login}/getClientProfile`, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${mt5ApiKey}`,
-          'Content-Type': 'application/json'
-        }
+      const response = await axios.get(`${MT5_API_BASE}/${login}/getClientProfile`, {
+        timeout: 5000,
       });
       
-      console.log('📡 MT5 API Response Status:', response.status);
+      const mt5Response = response.data;
       
-      if (response.ok) {
-        const mt5Data = await response.json();
+      // Check if MT5 API call was successful
+      if (mt5Response?.Success === true && mt5Response?.Data) {
+        const data = mt5Response.Data;
         
-        // Check if MT5 API returned success
-        if (mt5Data.Success === true) {
-          console.log('✅ MT5 API returned success:', mt5Data.Message);
-          // MT5 API returned successful data - convert to our format
-          const accountInfo = {
-            login: mt5Data.Data.Login,
-            name: mt5Data.Data.Name || `Account ${login}`,
-            balance: mt5Data.Data.Balance || 0,
-            credit: mt5Data.Data.Credit || 0,
-            equity: mt5Data.Data.Equity || 0,
-            margin: mt5Data.Data.Margin || 0,
-            free_margin: mt5Data.Data.MarginFree || 0,
-            margin_level: mt5Data.Data.MarginLevel || 0,
-            currency: 'USD',
-            leverage: mt5Data.Data.Leverage || 100,
-            group: mt5Data.Data.Group || 'demo',
-            status: mt5Data.Data.IsEnabled ? 'active' : 'inactive'
-          };
-          
-          res.json({ ok: true, account: accountInfo });
-        } else {
-          // MT5 API returned successful data
-          const accountInfo = {
-            login: login,
-            name: mt5Data.Data.Name || `Account ${login}`,
-            balance: mt5Data.Data.Balance || 0,
-            credit: mt5Data.Data.Credit || 0,
-            equity: mt5Data.Data.Equity || 0,
-            margin: mt5Data.Data.Margin || 0,
-            free_margin: mt5Data.Data.MarginFree || 0,
-            margin_level: mt5Data.Data.MarginLevel || 0,
-            currency: 'USD',
-            leverage: mt5Data.Data.Leverage || 100,
-            group: mt5Data.Data.Group || 'demo',
-            status: mt5Data.Data.IsEnabled ? 'active' : 'inactive'
-          };
-          
-          res.json({ ok: true, account: accountInfo });
-        }
-      } else {
-        // If MT5 API fails, return basic info
         const accountInfo = {
-          login: login,
-          name: `Account ${login}`,
-          balance: 0,
-          credit: 0,
-          equity: 0,
-          margin: 0,
-          free_margin: 0,
-          margin_level: 0,
-          currency: 'USD',
-          leverage: 100,
-          group: 'demo',
-          status: 'active'
+          Login: data.Login || login,
+          Name: (data.Name && data.Name.trim() !== "") ? data.Name : "-",
+          Group: (data.Group && data.Group.trim() !== "") ? data.Group : "-",
+          Balance: data.Balance || 0,
+          Credit: data.Credit || 0,
+          Equity: data.Equity || 0,
+          Margin: data.Margin || 0,
+          MarginFree: data.MarginFree || 0,
+          MarginLevel: data.MarginLevel || 0,
+          Leverage: data.Leverage ? data.Leverage.toString() : "-",
+          Comment: (data.Comment && data.Comment.trim() !== "") ? data.Comment : "-",
+          IsEnabled: data.IsEnabled,
+          Status: data.IsEnabled ? 'active' : 'inactive'
         };
         
         res.json({ ok: true, account: accountInfo });
+      } else {
+        console.warn(`⚠️ MT5 API call failed for account ${login}. Success: ${mt5Response?.Success}, Message: ${mt5Response?.Message}`);
+        res.json({ 
+          ok: false, 
+          error: `MT5 API call failed: ${mt5Response?.Message || 'Unknown error'}` 
+        });
       }
     } catch (mt5Error) {
-      console.log('MT5 API not available, using fallback data');
-      // Fallback to basic account info
-      const accountInfo = {
-        login: login,
-        name: `Account ${login}`,
-        balance: 0,
-        credit: 0,
-        equity: 0,
-        margin: 0,
-        free_margin: 0,
-        margin_level: 0,
-        currency: 'USD',
-        leverage: 100,
-        group: 'demo',
-        status: 'active'
-      };
-      
-      res.json({ ok: true, account: accountInfo });
+      console.error(`❌ MT5 API error for account ${login}:`, mt5Error.message);
+      res.json({ 
+        ok: false, 
+        error: `Failed to fetch MT5 account data: ${mt5Error.message}` 
+      });
     }
   } catch (err) {
     console.error('GET /admin/mt5/account/:login failed:', err);
@@ -2507,40 +2531,9 @@ app.get('/admin/mt5/balance-history', authenticateAdmin, async (req, res) => {
   }
 });
 
-// MT5 API Proxy endpoint
-app.get('/admin/mt5/account/:accountId', authenticateAdmin, async (req, res) => {
-  try {
-    const { accountId } = req.params;
-    
-    // Call the MT5 API
-    const response = await fetch(`http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`, {
-      method: 'GET',
-      headers: {
-        'accept': '*/*'
-      }
-    });
-    
-    if (!response.ok) {
-      throw new Error(`MT5 API returned ${response.status}: ${response.statusText}`);
-    }
-    
-    const data = await response.json();
-    
-    // Return the data in the expected format
-    res.json({
-      ok: true,
-      account: data.Data,
-      message: data.Message
-    });
-    
-  } catch (error) {
-    console.error('MT5 API proxy error:', error);
-    res.status(500).json({
-      ok: false,
-      error: `Failed to fetch MT5 account data: ${error.message}`
-    });
-  }
-});
+// MT5 API Proxy endpoint - REMOVED
+// This endpoint is no longer needed as the /admin/mt5/users endpoint
+// now provides all the account details directly, eliminating double API calls
 
 app.listen(PORT, async () => {
   console.log(`zuperior-admin-back listening on :${PORT}`);
