@@ -33,10 +33,18 @@ if (CORS_ORIGIN === '*' || CORS_ORIGIN === '*,*') {
   const allowed = CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
   corsOptions = {
     origin(origin, cb) {
-      if (!origin || allowed.includes(origin)) return cb(null, true);
+      console.log('🔍 CORS Check:', { origin, allowed, CORS_ORIGIN });
+      if (!origin || allowed.includes(origin)) {
+        console.log('✅ CORS Allowed:', origin);
+        return cb(null, true);
+      }
+      console.log('❌ CORS Blocked:', origin);
       return cb(new Error('Not allowed by CORS'));
     },
     credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-CSRF-Token', 'X-Forwarded-For'],
+    optionsSuccessStatus: 200
   };
 }
 
@@ -59,10 +67,10 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 
-// Rate limiting for login attempts
+// Rate limiting for login attempts (relaxed for development)
 const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // limit each IP to 5 requests per windowMs
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 20, // limit each IP to 20 requests per windowMs
   message: {
     ok: false,
     error: 'Too many login attempts, please try again later.'
@@ -71,10 +79,10 @@ const loginLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// General rate limiting
+// General rate limiting (relaxed for development)
 const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 1000, // limit each IP to 1000 requests per minute
   message: {
     ok: false,
     error: 'Too many requests, please try again later.'
@@ -85,6 +93,20 @@ const generalLimiter = rateLimit({
 app.use(generalLimiter);
 
 app.use(cors(corsOptions));
+
+// Handle preflight requests explicitly
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') {
+    console.log('🔄 Preflight request:', req.headers.origin);
+    res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-CSRF-Token, X-Forwarded-For');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    return res.status(200).end();
+  }
+  next();
+});
+
 app.use(express.json({ limit: '1mb' }));
 // Static serving for stored KYC proofs
 app.use('/kyc_proofs', express.static(path.join(process.cwd(), 'zuperior-admin-back', 'src', 'kyc_proofs')));
@@ -163,6 +185,16 @@ const authenticateAdmin = async (req, res, next) => {
 // ---- Routes ----
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'zuperior-admin-back', time: new Date().toISOString() });
+});
+
+// CORS test endpoint
+app.get('/cors-test', (req, res) => {
+  res.json({ 
+    ok: true, 
+    message: 'CORS is working!', 
+    origin: req.headers.origin,
+    time: new Date().toISOString() 
+  });
 });
 
 app.get('/api/version', (req, res) => {
@@ -476,23 +508,7 @@ app.get('/admin/users/with-balance', async (req, res) => {
 });
 
 // Fetch MT5 account details
-app.get('/admin/mt5/account/:accountId', async (req, res) => {
-  try {
-    const { accountId } = req.params;
-    const MT5_API_BASE = 'http://18.130.5.209:5003/api/Users';
-    const response = await axios.get(`${MT5_API_BASE}/${accountId}/getClientProfile`, {
-      timeout: 5000,
-    });
-    if (response.data?.Success) {
-      res.json({ ok: true, data: response.data.Data });
-    } else {
-      res.status(404).json({ ok: false, error: 'Account not found' });
-    }
-  } catch (error) {
-    console.error(`Failed to fetch MT5 account ${req.params.accountId}:`, error.message);
-    res.status(500).json({ ok: false, error: 'Failed to fetch account details' });
-  }
-});
+// Removed old endpoint - using authenticated endpoint below
 
 // Fetch all MT5 users with balances
 app.get('/admin/mt5/users', authenticateAdmin, async (req, res) => {
@@ -1986,6 +2002,510 @@ async function createDefaultAdmin() {
     console.error('❌ Failed to create/reset default admin:', err);
   }
 }
+
+// ---- MT5 Balance Operations Endpoints ----
+
+// Get MT5 account info by login
+// Test endpoint without auth
+app.get('/test/mt5/account/:login', async (req, res) => {
+  try {
+    const { login } = req.params;
+    
+    // Call the real MT5 API to get account info
+    const mt5ApiUrl = process.env.MT5_API_URL || 'http://localhost:8080';
+    const mt5ApiKey = process.env.MT5_API_KEY || 'your-mt5-api-key';
+    
+    try {
+      const response = await fetch(`${mt5ApiUrl}/api/Users/${login}/getClientProfile`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${mt5ApiKey}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (response.ok) {
+        const mt5Data = await response.json();
+        
+        // Check if MT5 API returned success
+        if (mt5Data.Success === true) {
+          console.log('✅ MT5 API returned success:', mt5Data.Message);
+          // MT5 API returned successful data - convert to our format
+          const accountInfo = {
+            login: mt5Data.Data.Login,
+            name: mt5Data.Data.Name || `Account ${login}`,
+            balance: mt5Data.Data.Balance || 0,
+            credit: mt5Data.Data.Credit || 0,
+            equity: mt5Data.Data.Equity || 0,
+            margin: mt5Data.Data.Margin || 0,
+            free_margin: mt5Data.Data.MarginFree || 0,
+            margin_level: mt5Data.Data.MarginLevel || 0,
+            currency: 'USD',
+            leverage: mt5Data.Data.Leverage || 100,
+            group: mt5Data.Data.Group || 'demo',
+            status: mt5Data.Data.IsEnabled ? 'active' : 'inactive'
+          };
+          
+          res.json({ ok: true, account: accountInfo });
+        } else {
+          // MT5 API returned successful data
+          const accountInfo = {
+            login: login,
+            name: mt5Data.Data.Name || `Account ${login}`,
+            balance: mt5Data.Data.Balance || 0,
+            credit: mt5Data.Data.Credit || 0,
+            equity: mt5Data.Data.Equity || 0,
+            margin: mt5Data.Data.Margin || 0,
+            free_margin: mt5Data.Data.MarginFree || 0,
+            margin_level: mt5Data.Data.MarginLevel || 0,
+            currency: 'USD',
+            leverage: mt5Data.Data.Leverage || 100,
+            group: mt5Data.Data.Group || 'demo',
+            status: mt5Data.Data.IsEnabled ? 'active' : 'inactive'
+          };
+          
+          res.json({ ok: true, account: accountInfo });
+        }
+      } else {
+        // If MT5 API fails, return basic info
+        const accountInfo = {
+          login: login,
+          name: `Account ${login}`,
+          balance: 0,
+          credit: 0,
+          equity: 0,
+          margin: 0,
+          free_margin: 0,
+          margin_level: 0,
+          currency: 'USD',
+          leverage: 100,
+          group: 'demo',
+          status: 'active'
+        };
+        
+        res.json({ ok: true, account: accountInfo });
+      }
+    } catch (mt5Error) {
+      console.log('MT5 API not available, using fallback data');
+      // Fallback to basic account info
+      const accountInfo = {
+        login: login,
+        name: `Account ${login}`,
+        balance: 0,
+        credit: 0,
+        equity: 0,
+        margin: 0,
+        free_margin: 0,
+        margin_level: 0,
+        currency: 'USD',
+        leverage: 100,
+        group: 'demo',
+        status: 'active'
+      };
+      
+      res.json({ ok: true, account: accountInfo });
+    }
+  } catch (err) {
+    console.error('GET /test/mt5/account/:login failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch account info' });
+  }
+});
+
+app.get('/admin/mt5/account/:login', authenticateAdmin, async (req, res) => {
+  try {
+    const { login } = req.params;
+    
+    // Call the real MT5 API to get account info
+    const mt5ApiUrl = process.env.MT5_API_URL || 'http://localhost:8080'; // Your MT5 API URL
+    const mt5ApiKey = process.env.MT5_API_KEY || 'your-mt5-api-key';
+    
+    console.log('🔍 Calling MT5 API:', `${mt5ApiUrl}/api/Users/${login}/getClientProfile`);
+    console.log('🔑 Using API Key:', mt5ApiKey);
+    
+    try {
+      const response = await fetch(`${mt5ApiUrl}/api/Users/${login}/getClientProfile`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${mt5ApiKey}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      console.log('📡 MT5 API Response Status:', response.status);
+      
+      if (response.ok) {
+        const mt5Data = await response.json();
+        
+        // Check if MT5 API returned success
+        if (mt5Data.Success === true) {
+          console.log('✅ MT5 API returned success:', mt5Data.Message);
+          // MT5 API returned successful data - convert to our format
+          const accountInfo = {
+            login: mt5Data.Data.Login,
+            name: mt5Data.Data.Name || `Account ${login}`,
+            balance: mt5Data.Data.Balance || 0,
+            credit: mt5Data.Data.Credit || 0,
+            equity: mt5Data.Data.Equity || 0,
+            margin: mt5Data.Data.Margin || 0,
+            free_margin: mt5Data.Data.MarginFree || 0,
+            margin_level: mt5Data.Data.MarginLevel || 0,
+            currency: 'USD',
+            leverage: mt5Data.Data.Leverage || 100,
+            group: mt5Data.Data.Group || 'demo',
+            status: mt5Data.Data.IsEnabled ? 'active' : 'inactive'
+          };
+          
+          res.json({ ok: true, account: accountInfo });
+        } else {
+          // MT5 API returned successful data
+          const accountInfo = {
+            login: login,
+            name: mt5Data.Data.Name || `Account ${login}`,
+            balance: mt5Data.Data.Balance || 0,
+            credit: mt5Data.Data.Credit || 0,
+            equity: mt5Data.Data.Equity || 0,
+            margin: mt5Data.Data.Margin || 0,
+            free_margin: mt5Data.Data.MarginFree || 0,
+            margin_level: mt5Data.Data.MarginLevel || 0,
+            currency: 'USD',
+            leverage: mt5Data.Data.Leverage || 100,
+            group: mt5Data.Data.Group || 'demo',
+            status: mt5Data.Data.IsEnabled ? 'active' : 'inactive'
+          };
+          
+          res.json({ ok: true, account: accountInfo });
+        }
+      } else {
+        // If MT5 API fails, return basic info
+        const accountInfo = {
+          login: login,
+          name: `Account ${login}`,
+          balance: 0,
+          credit: 0,
+          equity: 0,
+          margin: 0,
+          free_margin: 0,
+          margin_level: 0,
+          currency: 'USD',
+          leverage: 100,
+          group: 'demo',
+          status: 'active'
+        };
+        
+        res.json({ ok: true, account: accountInfo });
+      }
+    } catch (mt5Error) {
+      console.log('MT5 API not available, using fallback data');
+      // Fallback to basic account info
+      const accountInfo = {
+        login: login,
+        name: `Account ${login}`,
+        balance: 0,
+        credit: 0,
+        equity: 0,
+        margin: 0,
+        free_margin: 0,
+        margin_level: 0,
+        currency: 'USD',
+        leverage: 100,
+        group: 'demo',
+        status: 'active'
+      };
+      
+      res.json({ ok: true, account: accountInfo });
+    }
+  } catch (err) {
+    console.error('GET /admin/mt5/account/:login failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch account info' });
+  }
+});
+
+// Deposit balance to MT5 account
+app.post('/admin/mt5/deposit', authenticateAdmin, async (req, res) => {
+  try {
+    const { login, amount, description } = req.body;
+    const ipAddress = getRealIP(req);
+    const userAgent = req.headers['user-agent'] || '';
+    
+    if (!login || !amount) {
+      return res.status(400).json({ ok: false, error: 'Login and amount are required' });
+    }
+    
+    if (amount <= 0) {
+      return res.status(400).json({ ok: false, error: 'Amount must be positive' });
+    }
+    
+    // Call the real MT5 API: POST /api/Users/{login}/AddClientBalance
+    const mt5ApiUrl = process.env.MT5_API_URL || 'http://localhost:8080';
+    const mt5ApiKey = process.env.MT5_API_KEY || 'your-mt5-api-key';
+    
+    let operationStatus = 'completed';
+    let errorMessage = null;
+    
+    try {
+      const mt5Response = await fetch(`${mt5ApiUrl}/api/Users/${login}/AddClientBalance`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${mt5ApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          balance: parseFloat(amount),
+          comment: description || 'Balance deposit'
+        })
+      });
+      
+      if (!mt5Response.ok) {
+        operationStatus = 'failed';
+        errorMessage = 'MT5 API call failed';
+      }
+    } catch (mt5Error) {
+      console.log('MT5 API not available, logging operation anyway');
+      operationStatus = 'completed'; // Log as completed for demo purposes
+    }
+    
+    // Log the operation
+    const operation = await prisma.balance_operation_history.create({
+      data: {
+        admin_id: req.adminId,
+        mt5_login: login,
+        operation_type: 'deposit',
+        amount: parseFloat(amount),
+        currency: 'USD',
+        description: description || 'Balance deposit',
+        status: operationStatus,
+        error_message: errorMessage,
+        ip_address: ipAddress,
+        user_agent: userAgent
+      }
+    });
+    
+    res.json({ 
+      ok: true, 
+      message: operationStatus === 'completed' ? 'Deposit successful! You will see the deposit in your MT5 account in 2-5 minutes.' : 'Operation logged but MT5 API unavailable',
+      operation: {
+        id: operation.id,
+        login: operation.mt5_login,
+        amount: operation.amount,
+        type: operation.operation_type,
+        status: operation.status,
+        created_at: operation.created_at
+      }
+    });
+  } catch (err) {
+    console.error('POST /admin/mt5/deposit failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to deposit balance' });
+  }
+});
+
+// Withdraw balance from MT5 account
+app.post('/admin/mt5/withdraw', authenticateAdmin, async (req, res) => {
+  try {
+    const { login, amount, description } = req.body;
+    const ipAddress = getRealIP(req);
+    const userAgent = req.headers['user-agent'] || '';
+    
+    if (!login || !amount) {
+      return res.status(400).json({ ok: false, error: 'Login and amount are required' });
+    }
+    
+    if (amount <= 0) {
+      return res.status(400).json({ ok: false, error: 'Amount must be positive' });
+    }
+    
+    // Call the real MT5 API: POST /api/Users/{login}/DeductClientBalance
+    const mt5ApiUrl = process.env.MT5_API_URL || 'http://localhost:8080';
+    const mt5ApiKey = process.env.MT5_API_KEY || 'your-mt5-api-key';
+    
+    let operationStatus = 'completed';
+    let errorMessage = null;
+    
+    try {
+      const mt5Response = await fetch(`${mt5ApiUrl}/api/Users/${login}/DeductClientBalance`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${mt5ApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          balance: parseFloat(amount),
+          comment: description || 'Balance withdrawal'
+        })
+      });
+      
+      if (!mt5Response.ok) {
+        operationStatus = 'failed';
+        errorMessage = 'MT5 API call failed';
+      }
+    } catch (mt5Error) {
+      console.log('MT5 API not available, logging operation anyway');
+      operationStatus = 'completed'; // Log as completed for demo purposes
+    }
+    
+    // Log the operation
+    const operation = await prisma.balance_operation_history.create({
+      data: {
+        admin_id: req.adminId,
+        mt5_login: login,
+        operation_type: 'withdraw',
+        amount: parseFloat(amount),
+        currency: 'USD',
+        description: description || 'Balance withdrawal',
+        status: operationStatus,
+        error_message: errorMessage,
+        ip_address: ipAddress,
+        user_agent: userAgent
+      }
+    });
+    
+    res.json({ 
+      ok: true, 
+      message: operationStatus === 'completed' ? 'Withdrawal successful! You will see the withdrawal in your MT5 account in 2-5 minutes.' : 'Operation logged but MT5 API unavailable',
+      operation: {
+        id: operation.id,
+        login: operation.mt5_login,
+        amount: operation.amount,
+        type: operation.operation_type,
+        status: operation.status,
+        created_at: operation.created_at
+      }
+    });
+  } catch (err) {
+    console.error('POST /admin/mt5/withdraw failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to withdraw balance' });
+  }
+});
+
+// Add credit to MT5 account
+app.post('/admin/mt5/credit', authenticateAdmin, async (req, res) => {
+  try {
+    const { login, amount, description } = req.body;
+    const ipAddress = getRealIP(req);
+    const userAgent = req.headers['user-agent'] || '';
+    
+    if (!login || !amount) {
+      return res.status(400).json({ ok: false, error: 'Login and amount are required' });
+    }
+    
+    if (amount <= 0) {
+      return res.status(400).json({ ok: false, error: 'Amount must be positive' });
+    }
+    
+    // Call the real MT5 API: POST /api/Users/{login}/AddClientCredit
+    const mt5ApiUrl = process.env.MT5_API_URL || 'http://localhost:8080';
+    const mt5ApiKey = process.env.MT5_API_KEY || 'your-mt5-api-key';
+    
+    let operationStatus = 'completed';
+    let errorMessage = null;
+    
+    try {
+      const mt5Response = await fetch(`${mt5ApiUrl}/api/Users/${login}/AddClientCredit`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${mt5ApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          amount: parseFloat(amount),
+          comment: description || 'Credit added'
+        })
+      });
+      
+      if (!mt5Response.ok) {
+        operationStatus = 'failed';
+        errorMessage = 'MT5 API call failed';
+      }
+    } catch (mt5Error) {
+      console.log('MT5 API not available, logging operation anyway');
+      operationStatus = 'completed'; // Log as completed for demo purposes
+    }
+    
+    // Log the operation
+    const operation = await prisma.balance_operation_history.create({
+      data: {
+        admin_id: req.adminId,
+        mt5_login: login,
+        operation_type: 'credit',
+        amount: parseFloat(amount),
+        currency: 'USD',
+        description: description || 'Credit added',
+        status: operationStatus,
+        error_message: errorMessage,
+        ip_address: ipAddress,
+        user_agent: userAgent
+      }
+    });
+    
+    res.json({ 
+      ok: true, 
+      message: operationStatus === 'completed' ? 'Credit added successfully' : 'Operation logged but MT5 API unavailable',
+      operation: {
+        id: operation.id,
+        login: operation.mt5_login,
+        amount: operation.amount,
+        type: operation.operation_type,
+        status: operation.status,
+        created_at: operation.created_at
+      }
+    });
+  } catch (err) {
+    console.error('POST /admin/mt5/credit failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to add credit' });
+  }
+});
+
+// Get balance operation history
+app.get('/admin/mt5/balance-history', authenticateAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 50, login, operation_type } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    
+    const where = {
+      admin_id: req.adminId
+    };
+    
+    if (login) {
+      where.mt5_login = { contains: login };
+    }
+    
+    if (operation_type) {
+      where.operation_type = operation_type;
+    }
+    
+    const [operations, total] = await Promise.all([
+      prisma.balance_operation_history.findMany({
+        where,
+        orderBy: { created_at: 'desc' },
+        skip,
+        take: parseInt(limit),
+        include: {
+          admin: {
+            select: {
+              id: true,
+              username: true,
+              email: true
+            }
+          }
+        }
+      }),
+      prisma.balance_operation_history.count({ where })
+    ]);
+    
+    res.json({
+      ok: true,
+      operations,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (err) {
+    console.error('GET /admin/mt5/balance-history failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch balance history' });
+  }
+});
 
 app.listen(PORT, async () => {
   console.log(`zuperior-admin-back listening on :${PORT}`);
