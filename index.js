@@ -99,7 +99,7 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') {
     console.log('🔄 Preflight request:', req.headers.origin);
     res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-CSRF-Token, X-Forwarded-For');
     res.header('Access-Control-Allow-Credentials', 'true');
     return res.status(200).end();
