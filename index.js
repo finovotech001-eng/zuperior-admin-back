@@ -1708,6 +1708,89 @@ app.get('/admin/verify', async (req, res) => {
   }
 });
 
+// ===== PAYMENT METHODS MANAGEMENT =====
+// List pending and approved payment methods
+app.get('/admin/payment-methods', authenticateAdmin, async (req, res) => {
+  try {
+    const take = Math.min(parseInt(req.query.limit || '200', 10), 500);
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const skip = (page - 1) * take;
+    const q = (req.query.q || '').trim().toLowerCase();
+
+    // Fetch pending and approved separately (no pagination for simplicity)
+    const [pending, approved] = await Promise.all([
+      prisma.paymentMethod.findMany({ where: { status: 'pending' }, orderBy: { submittedAt: 'desc' } }),
+      prisma.paymentMethod.findMany({ where: { status: 'approved' }, orderBy: { approvedAt: 'desc' } }),
+    ]);
+
+    // Resolve user emails/names
+    const userIds = Array.from(new Set([...pending, ...approved].map(p => p.userId).filter(Boolean)));
+    const users = userIds.length
+      ? await prisma.user.findMany({
+          where: { id: { in: userIds } },
+          select: { id: true, email: true, name: true }
+        })
+      : [];
+    const userMap = Object.fromEntries(users.map(u => [u.id, u]));
+
+    const mapRow = (row) => ({
+      ...row,
+      user: userMap[row.userId] || null,
+    });
+
+    const pendingOut = pending.map(mapRow);
+    const approvedOut = approved.map(mapRow);
+
+    // Optional search by email/address/currency/network
+    const applyFilter = (arr) => (
+      q ? arr.filter(r => (
+        (r.user?.email || '').toLowerCase().includes(q) ||
+        (r.address || '').toLowerCase().includes(q) ||
+        (r.currency || '').toLowerCase().includes(q) ||
+        (r.network || '').toLowerCase().includes(q)
+      )) : arr
+    );
+
+    res.json({ ok: true, pending: applyFilter(pendingOut), approved: applyFilter(approvedOut) });
+  } catch (err) {
+    console.error('GET /admin/payment-methods failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch payment methods' });
+  }
+});
+
+// Approve a payment method
+app.put('/admin/payment-methods/:id/approve', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const adminId = req.adminId;
+    const now = new Date();
+    const updated = await prisma.paymentMethod.update({
+      where: { id },
+      data: { status: 'approved', approvedAt: now, approvedBy: String(adminId), updatedAt: now },
+    });
+    res.json({ ok: true, item: updated });
+  } catch (err) {
+    console.error('PUT /admin/payment-methods/:id/approve failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to approve payment method' });
+  }
+});
+
+// Reject a payment method
+app.put('/admin/payment-methods/:id/reject', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body || {};
+    const now = new Date();
+    const updated = await prisma.paymentMethod.update({
+      where: { id },
+      data: { status: 'rejected', rejectionReason: reason || 'Rejected', updatedAt: now },
+    });
+    res.json({ ok: true, item: updated });
+  } catch (err) {
+    console.error('PUT /admin/payment-methods/:id/reject failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to reject payment method' });
+  }
+});
 // Create default admin (for initial setup)
 // Test database connection
 app.get('/admin/test-db', async (req, res) => {
@@ -1816,6 +1899,23 @@ app.post('/admin/admins', async (req, res) => {
   }
 });
 
+// Delete admin (cannot delete superadmin)
+app.delete('/admin/admins/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const admin = await prisma.admin.findUnique({ where: { id: parseInt(id) } });
+    if (!admin) return res.status(404).json({ ok: false, error: 'Admin not found' });
+    if (admin.admin_role === 'superadmin') {
+      return res.status(403).json({ ok: false, error: 'Cannot delete superadmin' });
+    }
+    await prisma.admin.delete({ where: { id: parseInt(id) } });
+    res.json({ ok: true, message: 'Admin deleted' });
+  } catch (err) {
+    console.error('DELETE /admin/admins/:id failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to delete admin' });
+  }
+});
+
 app.post('/admin/setup', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -1854,6 +1954,67 @@ app.post('/admin/setup', async (req, res) => {
   } catch (err) {
     console.error('POST /admin/setup failed:', err);
     res.status(500).json({ ok: false, error: 'Failed to create admin' });
+  }
+});
+
+// ===== ROLE MANAGEMENT =====
+// Fetch all roles
+app.get('/admin/roles', async (req, res) => {
+  try {
+    const roles = await prisma.role.findMany({ orderBy: { createdAt: 'desc' } });
+    // Parse stored permissions JSON
+    const items = roles.map(r => ({
+      id: r.id,
+      name: r.name,
+      description: r.description,
+      permissions: (() => { try { return JSON.parse(r.permissions || '{}'); } catch { return {}; } })(),
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+    }));
+    res.json({ ok: true, roles: items });
+  } catch (err) {
+    console.error('GET /admin/roles failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch roles' });
+  }
+});
+
+// Create a new role
+app.post('/admin/roles', async (req, res) => {
+  try {
+    const { name, description, features } = req.body || {};
+    if (!name || !Array.isArray(features) || features.length === 0) {
+      return res.status(400).json({ ok: false, error: 'Role name and at least one feature are required' });
+    }
+
+    const id = crypto.randomUUID();
+    const now = new Date();
+    const permissions = JSON.stringify({ features });
+
+    const created = await prisma.role.create({
+      data: { id, name, description: description || null, permissions, createdAt: now, updatedAt: now },
+    });
+
+    res.json({ ok: true, role: { ...created, permissions: { features } } });
+  } catch (err) {
+    console.error('POST /admin/roles failed:', err);
+    if (err?.code === 'P2002') {
+      return res.status(409).json({ ok: false, error: 'Role name already exists' });
+    }
+    res.status(500).json({ ok: false, error: 'Failed to create role' });
+  }
+});
+
+// Delete a role
+app.delete('/admin/roles/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    // Optionally block deleting built-in roles
+    // Perform delete
+    await prisma.role.delete({ where: { id } });
+    res.json({ ok: true, message: 'Role deleted' });
+  } catch (err) {
+    console.error('DELETE /admin/roles/:id failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to delete role' });
   }
 });
 
