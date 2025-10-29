@@ -1758,6 +1758,182 @@ app.get('/admin/payment-methods', authenticateAdmin, async (req, res) => {
   }
 });
 
+// ===== SUPPORT TICKETS =====
+const STATUS_MAP = {
+  opened: ['Open', 'open', 'New', 'new'],
+  pending: ['Pending', 'pending'],
+  closed: ['Closed', 'closed'],
+};
+
+// List tickets with optional status filter
+app.get('/admin/support/tickets', authenticateAdmin, async (req, res) => {
+  try {
+    const { status, q = '' } = req.query;
+    const search = (q || '').toLowerCase();
+    const statusList = status && STATUS_MAP[status] ? STATUS_MAP[status] : null;
+
+    // Build base query
+    const whereParts = [];
+    const params = [];
+    if (statusList) {
+      whereParts.push(`t.status = ANY($${params.length + 1})`);
+      params.push(statusList);
+    }
+    if (search) {
+      whereParts.push(`(LOWER(t.title) LIKE $${params.length + 1} OR LOWER(t.description) LIKE $${params.length + 1} OR LOWER(u.email) LIKE $${params.length + 1})`);
+      params.push(`%${search}%`);
+    }
+    const whereClause = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+    const sql = `
+      SELECT t.*, u.email as user_email, u.name as user_name
+      FROM support_tickets t
+      LEFT JOIN "User" u ON (u.id = t.parent_id OR u."clientId" = t.parent_id OR LOWER(u.email) = LOWER(t.parent_id))
+      ${whereClause}
+      ORDER BY COALESCE(t.last_reply_at, t.created_at) DESC
+      LIMIT 500
+    `;
+
+    const { rows } = await pool.query(sql, params);
+
+    const countsSql = 'SELECT status, COUNT(*)::int as count FROM support_tickets GROUP BY status';
+    const counts = await pool.query(countsSql);
+
+    res.json({ ok: true, items: rows, counts: counts.rows });
+  } catch (err) {
+    console.error('GET /admin/support/tickets failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch support tickets' });
+  }
+});
+
+// Ticket details + replies
+app.get('/admin/support/tickets/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tSql = `
+      SELECT t.*, u.email as user_email, u.name as user_name
+      FROM support_tickets t
+      LEFT JOIN "User" u ON (u.id = t.parent_id OR u."clientId" = t.parent_id OR LOWER(u.email) = LOWER(t.parent_id))
+      WHERE t.id = $1
+    `;
+    const tResult = await pool.query(tSql, [id]);
+    if (tResult.rowCount === 0) return res.status(404).json({ ok: false, error: 'Ticket not found' });
+    const ticket = tResult.rows[0];
+    const rSql = 'SELECT * FROM support_ticket_replies WHERE ticket_id = $1 ORDER BY created_at ASC';
+    const replies = (await pool.query(rSql, [id])).rows;
+    res.json({ ok: true, ticket, replies });
+  } catch (err) {
+    console.error('GET /admin/support/tickets/:id failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch ticket' });
+  }
+});
+
+// Assign to current admin (adds greeting if fresh)
+app.post('/admin/support/tickets/:id/assign', authenticateAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const admin = req.admin; // set by middleware
+    const now = new Date();
+    await client.query('BEGIN');
+    const tRes = await client.query('SELECT * FROM chat_conversations WHERE id = $1::int FOR UPDATE', [id]);
+    if (tRes.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ ok: false, error: 'Ticket not found' }); }
+    const t = tRes.rows[0];
+    const assignChanged = (t.admin_id || '') !== (admin.email || String(admin.id));
+    await client.query(
+      'UPDATE chat_conversations SET admin_id = $1, status = $2, updated_at = $3 WHERE id = $4::int',
+      [admin.email || String(admin.id), (String(t.status || '').toLowerCase() === 'closed' ? 'open' : 'open'), now, id]
+    );
+    // Ensure a professional greeting exists once per conversation
+    const greeting = 'Hello! Welcome to Zuperior Support — how can I help you today?';
+    const firstAdminMsg = await client.query(
+      `SELECT id, content FROM chat_messages 
+       WHERE conversation_id = $1::int AND sender_type = 'admin' 
+       ORDER BY created_at ASC LIMIT 1`, [id]);
+    if (firstAdminMsg.rowCount === 0) {
+      const insertSql = `
+        INSERT INTO chat_messages
+          (conversation_id, sender_id, sender_name, sender_type, message_type, content, metadata, is_read, created_at, updated_at)
+        VALUES ($1::int, $2, $3, 'admin', 'text', $4, jsonb_build_object('is_internal', false), false, $5, $5)
+      `;
+      await client.query(insertSql, [id, String(admin.id), admin.email || 'support', greeting, now]);
+      await client.query('UPDATE chat_conversations SET last_message_at = $1 WHERE id = $2::int', [now, id]);
+    } else {
+      const msg = firstAdminMsg.rows[0];
+      if (/welcome to\s+zuperior\s+support/i.test(msg.content)) {
+        await client.query('UPDATE chat_messages SET content = $1, updated_at = $2 WHERE id = $3', [greeting, now, msg.id]);
+      }
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('POST /admin/support/tickets/:id/assign failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to assign ticket' });
+  } finally {
+    client.release();
+  }
+});
+
+// Add admin reply
+app.post('/admin/support/tickets/:id/replies', authenticateAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const { content, is_internal = false } = req.body || {};
+    if (!content || !content.trim()) return res.status(400).json({ ok: false, error: 'Content required' });
+    const admin = req.admin;
+    const now = new Date();
+    await client.query('BEGIN');
+    const insertSql = `
+      WITH ridseq AS (
+        SELECT COALESCE(MAX(reply_id), 0) + 1 AS rid FROM support_ticket_replies WHERE ticket_id = $1::int
+      )
+      INSERT INTO support_ticket_replies
+        (ticket_id, reply_id, sender_id, sender_name, sender_type, content, is_internal, attachments, created_at, updated_at, is_read)
+      SELECT $1::int, ridseq.rid, $2, $3, $4, $5, $6, ARRAY[]::text[], $7::timestamptz, $7::timestamptz, false FROM ridseq
+      RETURNING id, ticket_id, reply_id, sender_name, sender_type, content, is_internal, created_at
+    `;
+    const result = await client.query(insertSql, [id, String(admin.id), admin.email || 'support', 'admin', content, !!is_internal, now]);
+    await client.query('UPDATE support_tickets SET last_reply_at = $1::timestamptz, status = $2, updated_at = $1::timestamptz WHERE id = $3', [now, 'Open', id]);
+    await client.query('COMMIT');
+    const reply = result?.rows?.[0] || { ticket_id: id, content, sender_name: admin.email || 'support', sender_type: 'admin', created_at: now };
+    res.json({ ok: true, reply });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch {}
+    console.error('POST /admin/support/tickets/:id/replies failed:', err?.message || err, err?.stack || '');
+    console.error('Full error object:', err);
+    res.status(500).json({ ok: false, error: 'Failed to post reply' });
+  } finally {
+    client.release();
+  }
+});
+
+// Update ticket status (close / reopen / pending)
+app.put('/admin/support/tickets/:id/status', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body || {};
+    if (!status) return res.status(400).json({ ok: false, error: 'Status required' });
+    const now = new Date();
+    let sql, params;
+    if (String(status).toLowerCase() === 'closed') {
+      sql = 'UPDATE support_tickets SET status=$1, closed_at=$2, closed_by=$3, updated_at=$2 WHERE id=$4 RETURNING *';
+      params = ['Closed', now, req.admin?.email || String(req.adminId || ''), id];
+    } else if (String(status).toLowerCase() === 'pending') {
+      sql = 'UPDATE support_tickets SET status=$1, updated_at=$2 WHERE id=$3 RETURNING *';
+      params = ['Pending', now, id];
+    } else {
+      sql = 'UPDATE support_tickets SET status=$1, updated_at=$2 WHERE id=$3 RETURNING *';
+      params = ['Open', now, id];
+    }
+    const { rows } = await pool.query(sql, params);
+    res.json({ ok: true, ticket: rows[0] });
+  } catch (err) {
+    console.error('PUT /admin/support/tickets/:id/status failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to update status' });
+  }
+});
 // Approve a payment method
 app.put('/admin/payment-methods/:id/approve', authenticateAdmin, async (req, res) => {
   try {
