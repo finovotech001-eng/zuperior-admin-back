@@ -248,11 +248,69 @@ app.patch('/admin/users/:id/email-verify', async (req, res) => {
 app.delete('/admin/users/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    await prisma.user.delete({ where: { id } });
-    res.json({ ok: true });
+    
+    // Check if user exists first
+    const user = await prisma.user.findUnique({ where: { id } });
+    if (!user) {
+      return res.status(404).json({ ok: false, error: 'User not found' });
+    }
+    
+    // Use a transaction to handle related records
+    await prisma.$transaction(async (tx) => {
+      // Delete related records first (in order of dependencies)
+      
+      // Delete KYC records
+      await tx.kYC.deleteMany({ where: { userId: id } });
+      
+      // Delete activity logs
+      await tx.activityLog.deleteMany({ where: { userId: id } });
+      
+      // Delete user roles
+      await tx.userRole.deleteMany({ where: { userId: id } });
+      
+      // Delete MT5 accounts
+      await tx.mT5Account.deleteMany({ where: { userId: id } });
+      
+      // Delete transactions
+      await tx.transaction.deleteMany({ where: { userId: id } });
+      
+      // Delete deposits
+      await tx.deposit.deleteMany({ where: { userId: id } });
+      
+      // Delete withdrawals
+      await tx.withdrawal.deleteMany({ where: { userId: id } });
+      
+      // Delete payment methods
+      await tx.paymentMethod.deleteMany({ where: { userId: id } });
+      
+      // Finally delete the user
+      await tx.user.delete({ where: { id } });
+    });
+    
+    console.log(`✅ User ${id} deleted successfully`);
+    res.json({ ok: true, message: 'User deleted successfully' });
   } catch (err) {
     console.error('DELETE /admin/users/:id failed:', err);
-    res.status(500).json({ ok: false, error: 'Delete failed' });
+    
+    // Handle specific Prisma errors
+    if (err.code === 'P2003') {
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'Cannot delete user: Related records still exist. Please contact support.' 
+      });
+    }
+    
+    if (err.code === 'P2025') {
+      return res.status(404).json({ 
+        ok: false, 
+        error: 'User not found' 
+      });
+    }
+    
+    res.status(500).json({ 
+      ok: false, 
+      error: 'Delete failed: ' + (err.message || 'Unknown error') 
+    });
   }
 });
 
