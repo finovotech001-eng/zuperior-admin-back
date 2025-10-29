@@ -428,6 +428,117 @@ app.post('/admin/users', async (req, res) => {
   }
 });
 
+// Check if email exists in USER table
+app.post('/admin/users/check-email', async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ ok: false, error: 'Email is required' });
+    
+    // Check if email exists in USER table
+    const existingUser = await prisma.user.findFirst({
+      where: { email: email.toLowerCase().trim() },
+      select: { id: true, email: true }
+    });
+    
+    res.json({ 
+      ok: true, 
+      exists: !!existingUser,
+      message: existingUser ? 'Email already exists in USER table' : 'Email is available'
+    });
+  } catch (err) {
+    console.error('POST /admin/users/check-email failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to check email' });
+  }
+});
+
+// MT5 API Proxy endpoint to avoid CORS issues
+app.get('/admin/mt5/proxy/:accountId/getClientProfile', async (req, res) => {
+  try {
+    const { accountId } = req.params;
+    if (!accountId) return res.status(400).json({ ok: false, error: 'Account ID is required' });
+    
+    console.log(`[MT5 Proxy] Fetching account ${accountId}...`);
+    
+    // Make request to MT5 API server
+    const mt5Response = await axios.get(`http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`, {
+      timeout: 15000, // Increased timeout
+      headers: {
+        'Content-Type': 'application/json',
+        // Add any required MT5 API headers here
+      }
+    });
+    
+    console.log(`[MT5 Proxy] ✅ Account ${accountId} fetched successfully:`, {
+      success: mt5Response.data?.Success,
+      message: mt5Response.data?.Message,
+      hasData: !!mt5Response.data?.Data
+    });
+    
+    // Return the MT5 API response
+    res.json({
+      ok: true,
+      data: mt5Response.data
+    });
+  } catch (err) {
+    console.error(`[MT5 Proxy] ❌ Failed to fetch account ${req.params.accountId}:`, {
+      message: err.message,
+      code: err.code,
+      status: err.response?.status,
+      statusText: err.response?.statusText
+    });
+    res.status(500).json({ 
+      ok: false, 
+      error: err.message || 'Failed to fetch MT5 account details' 
+    });
+  }
+});
+
+// Test MT5 API connectivity
+app.get('/admin/mt5/test', async (req, res) => {
+  try {
+    console.log('[MT5 Test] Testing MT5 API connectivity...');
+    
+    // Test with a known account ID
+    const testAccountId = '19877040';
+    const mt5Response = await axios.get(`http://18.130.5.209:5003/api/Users/${testAccountId}/getClientProfile`, {
+      timeout: 10000,
+      headers: {
+        'Content-Type': 'application/json',
+      }
+    });
+    
+    console.log('[MT5 Test] ✅ MT5 API is accessible:', {
+      success: mt5Response.data?.Success,
+      message: mt5Response.data?.Message,
+      hasData: !!mt5Response.data?.Data
+    });
+    
+    res.json({
+      ok: true,
+      message: 'MT5 API is accessible',
+      testAccount: testAccountId,
+      response: mt5Response.data
+    });
+  } catch (err) {
+    console.error('[MT5 Test] ❌ MT5 API test failed:', {
+      message: err.message,
+      code: err.code,
+      status: err.response?.status,
+      statusText: err.response?.statusText
+    });
+    
+    res.status(500).json({
+      ok: false,
+      error: 'MT5 API is not accessible',
+      details: {
+        message: err.message,
+        code: err.code,
+        status: err.response?.status
+      }
+    });
+  }
+});
+
 // Fetch users with MT5 accounts and balances
 app.get('/admin/users/with-balance', async (req, res) => {
   try {
