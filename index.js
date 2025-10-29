@@ -42,7 +42,7 @@ if (CORS_ORIGIN === '*' || CORS_ORIGIN === '*,*') {
       return cb(new Error('Not allowed by CORS'));
     },
     credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-CSRF-Token', 'X-Forwarded-For'],
     optionsSuccessStatus: 200
   };
