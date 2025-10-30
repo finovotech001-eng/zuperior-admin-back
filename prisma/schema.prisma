@@ -1,0 +1,533 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Account {
+  id          String   @id
+  userId      String
+  accountType String
+  balance     Float    @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime
+  User        User     @relation(fields: [userId], references: [id])
+}
+
+model ActivityLog {
+  id        String   @id
+  userId    String?
+  adminId   String
+  action    String
+  entity    String
+  entityId  String?
+  ipAddress String?
+  userAgent String?
+  oldValues String?
+  newValues String?
+  createdAt DateTime @default(now())
+  User      User     @relation(fields: [adminId], references: [id])
+}
+
+model Deposit {
+  id                    String        @id
+  userId                String
+  mt5AccountId          String
+  amount                Float
+  currency              String        @default("USD")
+  method                String
+  paymentMethod         String?
+  transactionHash       String?
+  proofFileUrl          String?
+  bankDetails           String?
+  cryptoAddress         String?
+  depositAddress        String?
+  externalTransactionId String?
+  status                String        @default("pending")
+  rejectionReason       String?
+  approvedBy            String?
+  approvedAt            DateTime?
+  rejectedAt            DateTime?
+  processedAt           DateTime?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime
+  User                  User          @relation(fields: [userId], references: [id])
+  MT5Account            MT5Account    @relation(fields: [mt5AccountId], references: [id])
+  Transaction           Transaction[]
+
+  @@index([createdAt])
+  @@index([mt5AccountId])
+  @@index([status])
+  @@index([userId])
+}
+
+model KYC {
+  id                  String    @id
+  isDocumentVerified  Boolean   @default(false)
+  isAddressVerified   Boolean   @default(false)
+  verificationStatus  String    @default("Pending")
+  documentReference   String?
+  addressReference    String?
+  amlReference        String?
+  documentSubmittedAt DateTime?
+  addressSubmittedAt  DateTime?
+  rejectionReason     String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime
+  userId              String    @unique
+  User                User      @relation(fields: [userId], references: [id])
+}
+
+model MT5Account {
+  id             String           @id
+  accountId      String           @unique
+  userId         String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime
+  User           User?            @relation(fields: [userId], references: [id])
+  Deposit        Deposit[]
+  Withdrawal     Withdrawal[]
+  MT5Transaction MT5Transaction[]
+}
+
+model MT5Transaction {
+  id            String     @id
+  type          String
+  amount        Float
+  status        String     @default("pending")
+  paymentMethod String?
+  transactionId String?
+  comment       String?
+  mt5AccountId  String
+  createdAt     DateTime   @default(now())
+  currency      String     @default("USD")
+  depositId     String?
+  withdrawalId  String?
+  userId        String?
+  processedBy   String?
+  processedAt   DateTime?
+  updatedAt     DateTime
+  MT5Account    MT5Account @relation(fields: [mt5AccountId], references: [id])
+
+  @@index([depositId])
+  @@index([mt5AccountId])
+  @@index([status])
+  @@index([type])
+  @@index([userId])
+  @@index([withdrawalId])
+}
+
+model PaymentMethod {
+  id              String    @id
+  userId          String
+  address         String
+  currency        String    @default("USDT")
+  network         String    @default("TRC20")
+  status          String    @default("pending")
+  submittedAt     DateTime  @default(now())
+  approvedAt      DateTime?
+  approvedBy      String?
+  rejectionReason String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime
+
+  @@index([status])
+  @@index([userId])
+}
+
+model Role {
+  id          String   @id
+  name        String   @unique
+  permissions String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime
+}
+
+model SystemSetting {
+  id          String   @id
+  key         String   @unique
+  value       String
+  category    String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime
+}
+
+model Transaction {
+  id            String      @id
+  userId        String
+  type          String
+  amount        Float
+  status        String      @default("pending")
+  currency      String      @default("USD")
+  paymentMethod String?
+  transactionId String?
+  description   String?
+  metadata      String?
+  depositId     String?
+  withdrawalId  String?
+  updatedAt     DateTime
+  createdAt     DateTime    @default(now())
+  Deposit       Deposit?    @relation(fields: [depositId], references: [id])
+  User          User        @relation(fields: [userId], references: [id])
+  Withdrawal    Withdrawal? @relation(fields: [withdrawalId], references: [id])
+
+  @@index([depositId])
+  @@index([status])
+  @@index([type])
+  @@index([userId])
+  @@index([withdrawalId])
+}
+
+model User {
+  id            String        @id
+  clientId      String        @unique
+  email         String        @unique
+  password      String
+  name          String?
+  phone         String?
+  country       String?
+  createdAt     DateTime      @default(now())
+  emailVerified Boolean       @default(false)
+  lastLoginAt   DateTime?
+  role          String        @default("user")
+  status        String        @default("active")
+  Account       Account[]
+  ActivityLog   ActivityLog[]
+  Deposit       Deposit[]
+  KYC           KYC?
+  MT5Account    MT5Account[]
+  Transaction   Transaction[]
+  Withdrawal    Withdrawal[]
+}
+
+model UserRole {
+  id         String   @id
+  userId     String
+  roleId     String
+  assignedAt DateTime @default(now())
+  assignedBy String
+}
+
+model Withdrawal {
+  id                    String        @id
+  userId                String
+  mt5AccountId          String
+  amount                Float
+  method                String
+  bankDetails           String?
+  cryptoAddress         String?
+  status                String        @default("pending")
+  rejectionReason       String?
+  approvedBy            String?
+  approvedAt            DateTime?
+  rejectedAt            DateTime?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime
+  currency              String        @default("USD")
+  externalTransactionId String?
+  paymentMethod         String?
+  processedAt           DateTime?
+  walletAddress         String?
+  Transaction           Transaction[]
+  User                  User          @relation(fields: [userId], references: [id])
+  MT5Account            MT5Account    @relation(fields: [mt5AccountId], references: [id])
+
+  @@index([createdAt])
+  @@index([mt5AccountId])
+  @@index([status])
+  @@index([userId])
+}
+
+model chat_conversations {
+  id                 Int                 @id @default(autoincrement())
+  user_id            String              @db.VarChar(255)
+  user_name          String              @db.VarChar(255)
+  user_email         String              @db.VarChar(255)
+  admin_id           String?             @db.VarChar(255)
+  status             String?             @default("open") @db.VarChar(20)
+  priority           String?             @default("normal") @db.VarChar(20)
+  subject            String?             @db.VarChar(500)
+  last_message_at    DateTime?           @default(now()) @db.Timestamptz(6)
+  created_at         DateTime?           @default(now()) @db.Timestamptz(6)
+  updated_at         DateTime?           @default(now()) @db.Timestamptz(6)
+  closed_at          DateTime?           @db.Timestamptz(6)
+  closed_by          String?             @db.VarChar(255)
+  tags               String[]            @default([])
+  unread_count_admin Int?                @default(0)
+  unread_count_user  Int?                @default(0)
+  chat_messages      chat_messages[]
+  chat_participants  chat_participants[]
+}
+
+model chat_messages {
+  id                 Int                 @id @default(autoincrement())
+  conversation_id    Int?
+  sender_id          String              @db.VarChar(255)
+  sender_name        String              @db.VarChar(255)
+  sender_type        String              @db.VarChar(20)
+  message_type       String?             @default("text") @db.VarChar(20)
+  content            String
+  metadata           Json?               @default("{}")
+  is_read            Boolean?            @default(false)
+  read_at            DateTime?           @db.Timestamptz(6)
+  created_at         DateTime?           @default(now()) @db.Timestamptz(6)
+  updated_at         DateTime?           @default(now()) @db.Timestamptz(6)
+  chat_conversations chat_conversations? @relation(fields: [conversation_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+model chat_participants {
+  id                 Int                 @id @default(autoincrement())
+  conversation_id    Int?
+  user_id            String              @db.VarChar(255)
+  user_name          String              @db.VarChar(255)
+  user_type          String              @db.VarChar(20)
+  role               String?             @default("participant") @db.VarChar(20)
+  joined_at          DateTime?           @default(now()) @db.Timestamptz(6)
+  left_at            DateTime?           @db.Timestamptz(6)
+  is_active          Boolean?            @default(true)
+  chat_conversations chat_conversations? @relation(fields: [conversation_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([conversation_id, user_id])
+}
+
+model group_commission_structures {
+  id                      Int       @id @default(autoincrement())
+  group_id                String    @db.VarChar(255)
+  structure_name          String    @db.VarChar(100)
+  usd_per_lot             Decimal   @default(0.00) @db.Decimal(10, 2)
+  spread_share_percentage Decimal   @default(0.00) @db.Decimal(5, 2)
+  is_active               Boolean   @default(true)
+  created_at              DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at              DateTime? @default(now()) @db.Timestamptz(6)
+
+  @@unique([group_id, structure_name])
+}
+
+model admin {
+  id             Int       @id @default(autoincrement())
+  username       String    @unique @db.VarChar(255)
+  email          String    @unique @db.VarChar(255)
+  password_hash  String    @db.VarChar(255)
+  admin_role     String?   @default("admin") @db.VarChar(50)
+  is_active      Boolean?  @default(true)
+  last_login     DateTime? @db.Timestamptz(6)
+  login_attempts Int?      @default(0)
+  locked_until   DateTime? @db.Timestamptz(6)
+  created_at     DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime? @default(now()) @db.Timestamptz(6)
+  
+  // Relations
+  login_logs     admin_login_log[]
+}
+
+model admin_login_log {
+  id          Int      @id @default(autoincrement())
+  admin_id    Int
+  ip_address  String   @db.VarChar(45)  // IPv6 max length
+  user_agent  String?  @db.Text
+  location    String?  @db.VarChar(255)
+  device      String?  @db.VarChar(255)
+  browser     String?  @db.VarChar(255)
+  os          String?  @db.VarChar(255)
+  success     Boolean  @default(true)
+  failure_reason String? @db.VarChar(255)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  
+  // Relations
+  admin       admin    @relation(fields: [admin_id], references: [id], onDelete: Cascade)
+  
+  @@index([admin_id])
+  @@index([created_at])
+}
+
+model payment_gateway {
+  id                    Int      @id @default(autoincrement())
+  wallet_name           String   @db.VarChar(255)
+  deposit_wallet_address String  @db.VarChar(255)
+  api_key               String   @db.Text
+  secret_key            String   @db.Text
+  gateway_type          String   @db.VarChar(50)  // crypto, fiat, bank, card
+  is_active             Boolean  @default(true)
+  description           String?  @db.Text
+  created_at            DateTime @default(now()) @db.Timestamptz(6)
+  updated_at            DateTime @updatedAt @db.Timestamptz(6)
+  
+  @@index([gateway_type])
+  @@index([is_active])
+}
+
+model manual_gateway {
+  id          Int      @id @default(autoincrement())
+  type        String   @db.VarChar(50)  // crypto, wire, upi, local
+  name        String   @db.VarChar(255)
+  details     String   @db.Text
+  icon_url    String?  @db.VarChar(500)
+  qr_code_url String?  @db.VarChar(500)
+  is_active   Boolean  @default(true)
+  created_at  DateTime @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime @updatedAt @db.Timestamptz(6)
+  
+  @@index([type])
+  @@index([is_active])
+}
+
+model ib_admin {
+  id             Int       @id @default(autoincrement())
+  email          String    @unique @db.VarChar(255)
+  password_hash  String    @db.VarChar(255)
+  role           String?   @default("admin") @db.VarChar(50)
+  is_active      Boolean?  @default(true)
+  last_login     DateTime? @db.Timestamptz(6)
+  login_attempts Int?      @default(0)
+  locked_until   DateTime? @db.Timestamptz(6)
+  created_at     DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime? @default(now()) @db.Timestamptz(6)
+}
+
+model ib_requests {
+  id                        Int       @id @default(autoincrement())
+  full_name                 String    @db.VarChar(255)
+  email                     String    @unique @db.VarChar(255)
+  password_hash             String    @db.VarChar(255)
+  status                    String    @default("pending") @db.VarChar(50)
+  ib_type                   String    @default("common") @db.VarChar(50)
+  submitted_at              DateTime? @default(now()) @db.Timestamptz(6)
+  approved_at               DateTime? @db.Timestamptz(6)
+  usd_per_lot               Decimal?  @db.Decimal(10, 2)
+  spread_percentage_per_lot Decimal?  @db.Decimal(5, 2)
+  admin_comments            String?
+  group_id                  String?   @db.VarChar(255)
+  structure_id              Int?
+  created_at                DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at                DateTime? @default(now()) @db.Timestamptz(6)
+}
+
+model mt5_groups {
+  id          Int       @id @default(autoincrement())
+  group_id    String    @unique @db.VarChar(255)
+  name        String    @db.VarChar(255)
+  description String?
+  synced_at   DateTime? @default(now()) @db.Timestamptz(6)
+  created_at  DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime? @default(now()) @db.Timestamptz(6)
+}
+
+model symbols {
+  id            Int       @id @default(autoincrement())
+  symbol_name   String    @unique @db.VarChar(50)
+  description   String?
+  symbol_type   String?   @db.VarChar(20)
+  group_name    String?   @db.VarChar(100)
+  digits        Int?      @default(5)
+  spread        Float?    @default(0)
+  contract_size Int?      @default(100000)
+  profit_mode   String?   @default("forex") @db.VarChar(20)
+  enable        Boolean?  @default(true)
+  swap_mode     String?   @default("disabled") @db.VarChar(20)
+  swap_long     Float?    @default(0)
+  swap_short    Float?    @default(0)
+  swap3_day     String?   @default("wednesday") @db.VarChar(10)
+  created_at    DateTime? @default(now()) @db.Timestamp(6)
+  updated_at    DateTime? @default(now()) @db.Timestamp(6)
+}
+
+model support_tickets {
+  id             Int       @id @default(autoincrement())
+  ticket_no      String?   @db.VarChar(255)
+  ticket_type    String?   @db.VarChar(255)
+  title          String?   @db.VarChar(500)
+  description    String?   @db.Text
+  status         String?   @default("open") @db.VarChar(50)
+  priority       String?   @default("normal") @db.VarChar(20)
+  assigned_to    String?   @db.VarChar(255)
+  parent_id      String?   @db.VarChar(255)
+  account_number String?   @db.VarChar(255)
+  tags           String[]  @default([])
+  last_reply_at  DateTime? @db.Timestamptz(6)
+  created_at     DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at     DateTime? @default(now()) @db.Timestamptz(6)
+  closed_at      DateTime? @db.Timestamptz(6)
+  closed_by      String?   @db.VarChar(255)
+  user_id        String?   @db.VarChar(255)
+  user_name      String?   @db.VarChar(255)
+  user_email     String?   @db.VarChar(255)
+  
+  @@index([status])
+  @@index([user_id])
+  @@index([assigned_to])
+}
+
+model support_ticket_replies {
+  id           Int       @id @default(autoincrement())
+  ticket_id    Int
+  reply_id     Int?
+  sender_id    String    @db.VarChar(255)
+  sender_name  String    @db.VarChar(255)
+  sender_type  String    @db.VarChar(20)
+  content      String    @db.Text
+  is_internal  Boolean?  @default(false)
+  attachments  String[]  @default([])
+  is_read      Boolean?  @default(false)
+  created_at   DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at   DateTime? @default(now()) @db.Timestamptz(6)
+  
+  @@index([ticket_id])
+  @@index([sender_id])
+}
+
+model support_articles {
+  id          Int       @id @default(autoincrement())
+  title       String    @db.VarChar(500)
+  content     String    @db.Text
+  category_id Int?
+  is_published Boolean  @default(false)
+  created_at  DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime? @default(now()) @db.Timestamptz(6)
+  
+  @@index([category_id])
+  @@index([is_published])
+}
+
+model support_categories {
+  id          Int       @id @default(autoincrement())
+  name        String    @db.VarChar(255)
+  description String?   @db.Text
+  is_active   Boolean   @default(true)
+  created_at  DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime? @default(now()) @db.Timestamptz(6)
+}
+
+model support_faq {
+  id          Int       @id @default(autoincrement())
+  question    String    @db.Text
+  answer      String    @db.Text
+  category_id Int?
+  is_active   Boolean   @default(true)
+  created_at  DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at  DateTime? @default(now()) @db.Timestamptz(6)
+  
+  @@index([category_id])
+  @@index([is_active])
+}
+
+model support_replies {
+  id           Int       @id @default(autoincrement())
+  ticket_id    Int
+  sender_id    String    @db.VarChar(255)
+  sender_name  String    @db.VarChar(255)
+  sender_type  String    @db.VarChar(20)
+  content      String    @db.Text
+  is_internal  Boolean?  @default(false)
+  attachments  String[]  @default([])
+  is_read      Boolean?  @default(false)
+  created_at   DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at   DateTime? @default(now()) @db.Timestamptz(6)
+  
+  @@index([ticket_id])
+  @@index([sender_id])
+}
