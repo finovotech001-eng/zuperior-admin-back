@@ -1915,22 +1915,41 @@ app.put('/admin/support/tickets/:id/status', authenticateAdmin, async (req, res)
     const { id } = req.params;
     const { status } = req.body || {};
     if (!status) return res.status(400).json({ ok: false, error: 'Status required' });
+
     const now = new Date();
+    const normalized = String(status).toLowerCase();
+
+    // Detect available columns to avoid errors on older schemas
+    const cols = await pool.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'support_tickets' AND column_name IN ('closed_at','closed_by')`
+    );
+    const hasClosedAt = cols.rows.some(r => r.column_name === 'closed_at');
+    const hasClosedBy = cols.rows.some(r => r.column_name === 'closed_by');
+
     let sql, params;
-    if (String(status).toLowerCase() === 'closed') {
-      sql = 'UPDATE support_tickets SET status=$1, closed_at=$2, closed_by=$3, updated_at=$2 WHERE id=$4 RETURNING *';
-      params = ['Closed', now, req.admin?.email || String(req.adminId || ''), id];
-    } else if (String(status).toLowerCase() === 'pending') {
-      sql = 'UPDATE support_tickets SET status=$1, updated_at=$2 WHERE id=$3 RETURNING *';
+    if (normalized === 'closed') {
+      if (hasClosedAt && hasClosedBy) {
+        sql = 'UPDATE support_tickets SET status=$1, closed_at=$2, closed_by=$3, updated_at=$2 WHERE id=$4::int RETURNING *';
+        params = ['Closed', now, req.admin?.email || String(req.adminId || ''), id];
+      } else if (hasClosedAt && !hasClosedBy) {
+        sql = 'UPDATE support_tickets SET status=$1, closed_at=$2, updated_at=$2 WHERE id=$3::int RETURNING *';
+        params = ['Closed', now, id];
+      } else {
+        sql = 'UPDATE support_tickets SET status=$1, updated_at=$2 WHERE id=$3::int RETURNING *';
+        params = ['Closed', now, id];
+      }
+    } else if (normalized === 'pending') {
+      sql = 'UPDATE support_tickets SET status=$1, updated_at=$2 WHERE id=$3::int RETURNING *';
       params = ['Pending', now, id];
-    } else {
-      sql = 'UPDATE support_tickets SET status=$1, updated_at=$2 WHERE id=$3 RETURNING *';
+    } else { // open
+      sql = 'UPDATE support_tickets SET status=$1, updated_at=$2 WHERE id=$3::int RETURNING *';
       params = ['Open', now, id];
     }
+
     const { rows } = await pool.query(sql, params);
     res.json({ ok: true, ticket: rows[0] });
   } catch (err) {
-    console.error('PUT /admin/support/tickets/:id/status failed:', err);
+    console.error('PUT /admin/support/tickets/:id/status failed:', err?.message || err);
     res.status(500).json({ ok: false, error: 'Failed to update status' });
   }
 });
@@ -3044,4 +3063,47 @@ app.get('/admin/mt5/balance-history', authenticateAdmin, async (req, res) => {
 app.listen(PORT, async () => {
   console.log(`zuperior-admin-back listening on :${PORT}`);
   await createDefaultAdmin();
+});
+
+// --- CREATE country admin (POST) ---
+app.post('/admin/country-admins', async (req, res) => {
+  try {
+    const { name, email, password, status, features, country } = req.body;
+    if (!name || !email || !password || !status || !country) {
+      return res.status(400).json({ error: 'Missing required fields.' });
+    }
+    const featuresStr = Array.isArray(features) ? features.join(',') : (features || '');
+    const insert =
+      `INSERT INTO country_admin (name, email, password, status, country, features, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`;
+    const result = await pool.query(insert, [name, email, password, status, country, featuresStr]);
+    res.json({ ok: true, admin: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// --- READ (GET) all country admins ---
+app.get('/admin/country-admins', async (req, res) => {
+  try {
+    const select = `SELECT * FROM country_admin ORDER BY id ASC`;
+    const result = await pool.query(select);
+    // Parse features (string) to array
+    const admins = result.rows.map(a => ({
+      ...a,
+      features: a.features ? a.features.split(',') : [],
+    }));
+    res.json(admins);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get unique countries from user registration data for dropdowns
+app.get('/admin/countries', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT code, country FROM public.countries ORDER BY country ASC');
+    res.json({ ok: true, countries: result.rows });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
