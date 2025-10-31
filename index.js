@@ -1919,34 +1919,36 @@ app.put('/admin/support/tickets/:id/status', authenticateAdmin, async (req, res)
     const now = new Date();
     const normalized = String(status).toLowerCase();
 
-    // Detect available columns to avoid errors on older schemas
-    const cols = await pool.query(
-      `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'support_tickets' AND column_name IN ('closed_at','closed_by')`
+    // Discover available columns for robust updates across schemas
+    const { rows: colrows } = await pool.query(
+      `SELECT column_name FROM information_schema.columns 
+       WHERE table_schema = 'public' AND table_name = 'support_tickets'`
     );
-    const hasClosedAt = cols.rows.some(r => r.column_name === 'closed_at');
-    const hasClosedBy = cols.rows.some(r => r.column_name === 'closed_by');
+    const has = (c) => colrows.some(r => r.column_name === c);
 
-    let sql, params;
+    // Ensure at least the status column exists
+    if (!has('status')) return res.status(500).json({ ok: false, error: 'support_tickets.status column missing' });
+
+    const sets = [];
+    const params = [];
+
+    // 1) status
+    const finalStatus = normalized === 'closed' ? 'Closed' : normalized === 'pending' ? 'Pending' : 'Open';
+    params.push(finalStatus); sets.push(`status = $${params.length}`);
+
+    // 2) timestamps
+    if (has('updated_at')) { params.push(now); sets.push(`updated_at = $${params.length}`); }
     if (normalized === 'closed') {
-      if (hasClosedAt && hasClosedBy) {
-        sql = 'UPDATE support_tickets SET status=$1, closed_at=$2, closed_by=$3, updated_at=$2 WHERE id=$4::int RETURNING *';
-        params = ['Closed', now, req.admin?.email || String(req.adminId || ''), id];
-      } else if (hasClosedAt && !hasClosedBy) {
-        sql = 'UPDATE support_tickets SET status=$1, closed_at=$2, updated_at=$2 WHERE id=$3::int RETURNING *';
-        params = ['Closed', now, id];
-      } else {
-        sql = 'UPDATE support_tickets SET status=$1, updated_at=$2 WHERE id=$3::int RETURNING *';
-        params = ['Closed', now, id];
-      }
-    } else if (normalized === 'pending') {
-      sql = 'UPDATE support_tickets SET status=$1, updated_at=$2 WHERE id=$3::int RETURNING *';
-      params = ['Pending', now, id];
-    } else { // open
-      sql = 'UPDATE support_tickets SET status=$1, updated_at=$2 WHERE id=$3::int RETURNING *';
-      params = ['Open', now, id];
+      if (has('closed_at')) { params.push(now); sets.push(`closed_at = $${params.length}`); }
+      if (has('closed_by')) { params.push(req.admin?.email || String(req.adminId || '')); sets.push(`closed_by = $${params.length}`); }
     }
 
+    // Build SQL
+    params.push(id);
+    const sql = `UPDATE support_tickets SET ${sets.join(', ')} WHERE id = $${params.length}::int RETURNING *`;
+
     const { rows } = await pool.query(sql, params);
+    if (!rows || rows.length === 0) return res.status(404).json({ ok: false, error: 'Ticket not found' });
     res.json({ ok: true, ticket: rows[0] });
   } catch (err) {
     console.error('PUT /admin/support/tickets/:id/status failed:', err?.message || err);
