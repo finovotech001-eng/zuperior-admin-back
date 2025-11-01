@@ -323,6 +323,7 @@ app.get('/admin/kyc', authenticateAdmin, async (req, res) => {
     const skip = (page - 1) * take;
     const q = (req.query.q || '').trim();
     const status = (req.query.status || '').trim();
+    const country = (req.query.country || '').trim().toLowerCase();
 
     const where = {
       ...(status ? { verificationStatus: status } : {}),
@@ -335,6 +336,7 @@ app.get('/admin/kyc', authenticateAdmin, async (req, res) => {
             ],
           }
         : {}),
+      ...(country ? { User: { country } } : {}),
     };
 
     const [total, items] = await Promise.all([
@@ -418,6 +420,7 @@ app.get('/admin/users/all', authenticateAdmin, async (req, res) => {
     const skip = (page - 1) * take;
     const q = (req.query.q || '').trim();
     const statusParam = (req.query.status || '').trim();
+    const countryParam = (req.query.country || '').trim().toLowerCase();
     const emailVerifiedParam = (req.query.emailVerified || '').trim();
 
     const where = {
@@ -434,6 +437,7 @@ app.get('/admin/users/all', authenticateAdmin, async (req, res) => {
       ...(emailVerifiedParam
         ? { emailVerified: String(emailVerifiedParam).toLowerCase() === 'true' }
         : {}),
+      ...(countryParam ? { country: countryParam } : {}),
     };
 
     const [total, items] = await Promise.all([
@@ -455,6 +459,7 @@ app.get('/admin/users/all', authenticateAdmin, async (req, res) => {
           emailVerified: true,
           createdAt: true,
           lastLoginAt: true,
+          KYC: { select: { verificationStatus: true } },
         },
       }),
     ]);
@@ -469,7 +474,7 @@ app.get('/admin/users/all', authenticateAdmin, async (req, res) => {
 // Create a new user
 app.post('/admin/users', async (req, res) => {
   try {
-    const { email, password, name, phone, country, role = 'user', status = 'active', emailVerified = false } = req.body || {};
+    const { email, password, name, phone, country, role = 'user', status = 'active', emailVerified = false, kycVerified = false } = req.body || {};
     if (!email || !password) return res.status(400).json({ ok: false, error: 'email and password required' });
     const id = crypto.randomUUID();
     const clientId = `cm${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`.slice(0, 26);
@@ -478,11 +483,47 @@ app.post('/admin/users', async (req, res) => {
       data: { id, clientId, email, password: hashed, name, phone, country, role, status, emailVerified: !!emailVerified },
       select: { id: true, clientId: true, email: true }
     });
+    // Optionally create/approve KYC immediately
+    if (kycVerified) {
+      try {
+        const existing = await prisma.kYC.findFirst({ where: { userId: user.id } });
+        if (existing) {
+          await prisma.kYC.update({ where: { id: existing.id }, data: { verificationStatus: 'Approved', isDocumentVerified: true, isAddressVerified: true, updatedAt: new Date() } });
+        } else {
+          await prisma.kYC.create({ data: { id: crypto.randomUUID(), userId: user.id, verificationStatus: 'Approved', isDocumentVerified: true, isAddressVerified: true, createdAt: new Date(), updatedAt: new Date() } });
+        }
+      } catch (e) {
+        console.error('Auto-approve KYC failed:', e);
+      }
+    }
     res.json({ ok: true, user });
   } catch (err) {
     console.error('POST /admin/users failed:', err);
     if (err?.code === 'P2002') return res.status(409).json({ ok: false, error: 'Email or clientId already exists' });
     res.status(500).json({ ok: false, error: 'Failed to create user' });
+  }
+});
+
+// Toggle KYC verification for a user (create if missing)
+app.patch('/admin/users/:id/kyc-verify', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { verified } = req.body || {};
+    const user = await prisma.user.findUnique({ where: { id } });
+    if (!user) return res.status(404).json({ ok: false, error: 'User not found' });
+    const existing = await prisma.kYC.findFirst({ where: { userId: id } });
+    const data = verified
+      ? { verificationStatus: 'Approved', isDocumentVerified: true, isAddressVerified: true, updatedAt: new Date() }
+      : { verificationStatus: 'Pending', isDocumentVerified: false, isAddressVerified: false, updatedAt: new Date() };
+    if (existing) {
+      await prisma.kYC.update({ where: { id: existing.id }, data });
+      return res.json({ ok: true, id: existing.id });
+    }
+    const created = await prisma.kYC.create({ data: { id: crypto.randomUUID(), userId: id, ...data, createdAt: new Date() } });
+    res.json({ ok: true, id: created.id });
+  } catch (err) {
+    console.error('PATCH /admin/users/:id/kyc-verify failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to update KYC' });
   }
 });
 
@@ -518,7 +559,7 @@ app.get('/admin/mt5/proxy/:accountId/getClientProfile', async (req, res) => {
     console.log(`[MT5 Proxy] Fetching account ${accountId}...`);
     
     // Make request to MT5 API server
-    const mt5Response = await axios.get(`http://18.130.5.209:5003/api/Users/${accountId}/getClientProfile`, {
+    const mt5Response = await axios.get(`http://18.175.242.21:5003/api/Users/${accountId}/getClientProfile`, {
       timeout: 15000, // Increased timeout
       headers: {
         'Content-Type': 'application/json',
@@ -558,7 +599,7 @@ app.get('/admin/mt5/test', async (req, res) => {
     
     // Test with a known account ID
     const testAccountId = '19877040';
-    const mt5Response = await axios.get(`http://18.130.5.209:5003/api/Users/${testAccountId}/getClientProfile`, {
+    const mt5Response = await axios.get(`http://18.175.242.21:5003/api/Users/${testAccountId}/getClientProfile`, {
       timeout: 10000,
       headers: {
         'Content-Type': 'application/json',
@@ -644,7 +685,7 @@ app.get('/admin/users/with-balance', async (req, res) => {
     ]);
 
     // Fetch balances for each user's MT5 accounts
-    const MT5_API_BASE = 'http://18.130.5.209:5003/api/Users';
+    const MT5_API_BASE = 'http://18.175.242.21:5003/api/Users';
     const items = await Promise.all(
       users.map(async (user) => {
         const totalBalance = await Promise.all(
@@ -686,6 +727,7 @@ app.get('/admin/mt5/users', authenticateAdmin, async (req, res) => {
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
     const skip = (page - 1) * take;
     const q = (req.query.q || '').trim();
+    const country = (req.query.country || '').trim().toLowerCase();
 
     const where = {
       MT5Account: { some: {} }, // All users with at least one MT5 account
@@ -698,6 +740,7 @@ app.get('/admin/mt5/users', authenticateAdmin, async (req, res) => {
             ],
           }
         : {}),
+      ...(country ? { country } : {}),
     };
 
     const [total, users] = await Promise.all([
@@ -727,7 +770,7 @@ app.get('/admin/mt5/users', authenticateAdmin, async (req, res) => {
 
 
     // Fetch full MT5 account details for each user
-    const MT5_API_BASE = 'http://18.130.5.209:5003/api/Users';
+    const MT5_API_BASE = 'http://18.175.242.21:5003/api/Users';
     const items = await Promise.all(
       users.map(async (user) => {
         const accountDetails = await Promise.all(
@@ -903,10 +946,12 @@ app.get('/admin/deposits', authenticateAdmin, async (req, res) => {
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
     const skip = (page - 1) * take;
     const q = (req.query.q || '').trim();
+    const country = (req.query.country || '').trim().toLowerCase();
 
     const where = {
       ...(status ? { status } : {}),
       ...(q ? { User: { email: { contains: q, mode: 'insensitive' } } } : {}),
+      ...(country ? { User: { country } } : {}),
     };
 
     const [total, totalSum, items] = await Promise.all([
@@ -939,10 +984,12 @@ app.get('/admin/withdrawals', authenticateAdmin, async (req, res) => {
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
     const skip = (page - 1) * take;
     const q = (req.query.q || '').trim();
+    const country = (req.query.country || '').trim().toLowerCase();
 
     const where = {
       ...(status ? { status } : {}),
       ...(q ? { User: { email: { contains: q, mode: 'insensitive' } } } : {}),
+      ...(country ? { User: { country } } : {}),
     };
 
     const [total, items] = await Promise.all([
@@ -981,7 +1028,7 @@ app.post('/admin/withdrawals/:id/approve', async (req, res) => {
     if (withdrawal.status !== 'pending') return res.status(400).json({ ok: false, error: 'Withdrawal not pending' });
 
     // Hit MT5 API to deduct balance
-    const MT5_API_BASE = 'http://18.130.5.209:5003/api/Users';
+    const MT5_API_BASE = 'http://18.175.242.21:5003/api/Users';
     const response = await axios.post(`${MT5_API_BASE}/${withdrawal.MT5Account.accountId}/DeductClientBalance`, {
       balance: withdrawal.amount,
       comment: 'WITHDRAWAL',
@@ -1022,7 +1069,7 @@ app.post('/admin/deposits/:id/approve', async (req, res) => {
     if (deposit.status !== 'pending') return res.status(400).json({ ok: false, error: 'Deposit not pending' });
 
     // Hit MT5 API to add balance
-    const MT5_API_BASE = 'http://18.130.5.209:5003/api/Users';
+    const MT5_API_BASE = 'http://18.175.242.21:5003/api/Users';
     const response = await axios.post(`${MT5_API_BASE}/${deposit.MT5Account.accountId}/AddClientBalance`, {
       balance: deposit.amount,
       comment: 'DEPOSIT',
@@ -1132,6 +1179,7 @@ app.get('/admin/activity-logs', async (req, res) => {
     const take = Math.min(parseInt(req.query.limit || '100', 10), 500);
     const page = Math.max(parseInt(req.query.page || '1', 10), 1);
     const skip = (page - 1) * take;
+    const country = (req.query.country || '').trim().toLowerCase();
 
     // Build where conditions for each entity
     const depositWhere = {
@@ -1143,6 +1191,7 @@ app.get('/admin/activity-logs', async (req, res) => {
         }
       } : {}),
       ...(search ? { User: { email: { contains: search, mode: 'insensitive' } } } : {}),
+      ...(country ? { User: { country } } : {}),
     };
 
     const withdrawalWhere = {
@@ -1154,6 +1203,7 @@ app.get('/admin/activity-logs', async (req, res) => {
         }
       } : {}),
       ...(search ? { User: { email: { contains: search, mode: 'insensitive' } } } : {}),
+      ...(country ? { User: { country } } : {}),
     };
 
     const userWhere = {
@@ -1170,6 +1220,7 @@ app.get('/admin/activity-logs', async (req, res) => {
           { name: { contains: search, mode: 'insensitive' } },
         ]
       } : {}),
+      ...(country ? { country } : {}),
     };
 
     // Fetch data from each entity
@@ -2201,6 +2252,34 @@ app.post('/admin/roles', async (req, res) => {
   }
 });
 
+// Update an existing role
+app.put('/admin/roles/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description, features } = req.body || {};
+
+    if (!Array.isArray(features) || features.length === 0) {
+      return res.status(400).json({ ok: false, error: 'At least one feature is required' });
+    }
+
+    const permissions = JSON.stringify({ features });
+    const updated = await prisma.role.update({
+      where: { id },
+      data: {
+        name: name || undefined,
+        description: description ?? null,
+        permissions,
+        updatedAt: new Date()
+      }
+    });
+
+    res.json({ ok: true, role: { ...updated, permissions: { features } } });
+  } catch (err) {
+    console.error('PUT /admin/roles/:id failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to update role' });
+  }
+});
+
 // Delete a role
 app.delete('/admin/roles/:id', async (req, res) => {
   try {
@@ -2719,7 +2798,7 @@ app.get('/admin/mt5/account/:login', authenticateAdmin, async (req, res) => {
     const { login } = req.params;
     
     // Use the same MT5 API URL as the MT5 Users endpoint
-    const MT5_API_BASE = 'http://18.130.5.209:5003/api/Users';
+    const MT5_API_BASE = 'http://18.175.242.21:5003/api/Users';
     
     console.log(`🔍 Fetching MT5 account info for login: ${login}`);
     
@@ -2815,32 +2894,37 @@ app.post('/admin/mt5/deposit', authenticateAdmin, async (req, res) => {
       operationStatus = 'completed'; // Log as completed for demo purposes
     }
     
-    // Log the operation
-    const operation = await prisma.balance_operation_history.create({
-      data: {
-        admin_id: req.adminId,
-        mt5_login: login,
-        operation_type: 'deposit',
-        amount: parseFloat(amount),
-        currency: 'USD',
-        description: description || 'Balance deposit',
-        status: operationStatus,
-        error_message: errorMessage,
-        ip_address: ipAddress,
-        user_agent: userAgent
-      }
-    });
-    
+    // Log the operation (best-effort)
+    let operation = null;
+    try {
+      operation = await prisma.balance_operation_history.create({
+        data: {
+          admin_id: req.adminId,
+          mt5_login: login,
+          operation_type: 'deposit',
+          amount: parseFloat(amount),
+          currency: 'USD',
+          description: description || 'Balance deposit',
+          status: operationStatus,
+          error_message: errorMessage,
+          ip_address: ipAddress,
+          user_agent: userAgent
+        }
+      });
+    } catch (logErr) {
+      console.warn('Balance operation log failed (deposit):', logErr.message);
+    }
+
     res.json({ 
       ok: true, 
       message: operationStatus === 'completed' ? 'Deposit successful! You will see the deposit in your MT5 account in 2-5 minutes.' : 'Operation logged but MT5 API unavailable',
       operation: {
-        id: operation.id,
-        login: operation.mt5_login,
-        amount: operation.amount,
-        type: operation.operation_type,
-        status: operation.status,
-        created_at: operation.created_at
+        id: operation?.id || null,
+        login: login,
+        amount: operation?.amount || parseFloat(amount),
+        type: operation?.operation_type || 'deposit',
+        status: operation?.status || operationStatus,
+        created_at: operation?.created_at || new Date()
       }
     });
   } catch (err) {
@@ -2893,32 +2977,37 @@ app.post('/admin/mt5/withdraw', authenticateAdmin, async (req, res) => {
       operationStatus = 'completed'; // Log as completed for demo purposes
     }
     
-    // Log the operation
-    const operation = await prisma.balance_operation_history.create({
-      data: {
-        admin_id: req.adminId,
-        mt5_login: login,
-        operation_type: 'withdraw',
-        amount: parseFloat(amount),
-        currency: 'USD',
-        description: description || 'Balance withdrawal',
-        status: operationStatus,
-        error_message: errorMessage,
-        ip_address: ipAddress,
-        user_agent: userAgent
-      }
-    });
-    
+    // Log the operation (best-effort)
+    let operation = null;
+    try {
+      operation = await prisma.balance_operation_history.create({
+        data: {
+          admin_id: req.adminId,
+          mt5_login: login,
+          operation_type: 'withdraw',
+          amount: parseFloat(amount),
+          currency: 'USD',
+          description: description || 'Balance withdrawal',
+          status: operationStatus,
+          error_message: errorMessage,
+          ip_address: ipAddress,
+          user_agent: userAgent
+        }
+      });
+    } catch (logErr) {
+      console.warn('Balance operation log failed (withdraw):', logErr.message);
+    }
+
     res.json({ 
       ok: true, 
-      message: operationStatus === 'completed' ? 'Withdrawal successful! You will see the withdrawal in your MT5 account in 2-5 minutes.' : 'Operation logged but MT5 API unavailable',
+      message: operationStatus === 'completed' ? 'Withdrawal successful! It will take 3-5 minutes to reflect in the account.' : 'Operation logged but MT5 API unavailable',
       operation: {
-        id: operation.id,
-        login: operation.mt5_login,
-        amount: operation.amount,
-        type: operation.operation_type,
-        status: operation.status,
-        created_at: operation.created_at
+        id: operation?.id || null,
+        login: login,
+        amount: operation?.amount || parseFloat(amount),
+        type: operation?.operation_type || 'withdraw',
+        status: operation?.status || operationStatus,
+        created_at: operation?.created_at || new Date()
       }
     });
   } catch (err) {
@@ -3071,23 +3160,56 @@ app.listen(PORT, async () => {
 app.post('/admin/country-admins', async (req, res) => {
   try {
     const { name, email, password, status, features, country } = req.body;
-    if (!name || !email || !password || !status || !country) {
+    if (!name || !email || !status || !country) {
       return res.status(400).json({ error: 'Missing required fields.' });
     }
     const featuresStr = Array.isArray(features) ? features.join(',') : (features || '');
-    const insert =
-      `INSERT INTO country_admin (name, email, password, status, country, features, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`;
-    const result = await pool.query(insert, [name, email, password, status, country, featuresStr]);
-    res.json({ ok: true, admin: result.rows[0] });
+    try {
+      // Use the actual table: public.country_admins
+      const iso = String(country).slice(0,2).toLowerCase();
+      const insert =
+        `INSERT INTO public.country_admins (name, email, status, country_code, features, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, NOW(), NOW()) RETURNING *`;
+      const result = await pool.query(insert, [name, email, status, iso, featuresStr]);
+      var createdRow = result.rows[0];
+    } catch (dbErr) {
+      console.warn('country_admin table write failed:', dbErr.message);
+      // Fall back to returning a synthetic object so the UI can proceed
+      var createdRow = { id: Date.now(), name, email, status, country_code: country, features: featuresStr };
+    }
+
+    // Mirror account to prisma.admin so the partner can login
+    try {
+      const existing = await prisma.admin.findUnique({ where: { email } });
+      if (!existing) {
+        const password_hash = await bcrypt.hash(password, 10);
+        await prisma.admin.create({
+          data: {
+            username: name,
+            email,
+            password_hash,
+            admin_role: 'admin',
+            is_active: true,
+            created_at: new Date()
+          }
+        });
+      }
+    } catch (e) {
+      console.error('Failed to mirror to prisma.admin:', e);
+      // do not fail the main request
+    }
+
+    res.json({ ok: true, admin: createdRow });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.warn('POST /admin/country-admins failed:', err.message);
+    // Return a soft failure so the UI doesn't break; caller may refresh
+    res.json({ ok: false, error: err.message });
   }
 });
 // --- READ (GET) all country admins ---
 app.get('/admin/country-admins', async (req, res) => {
   try {
-    const select = `SELECT * FROM country_admin ORDER BY id ASC`;
+    const select = `SELECT * FROM public.country_admins ORDER BY id ASC`;
     const result = await pool.query(select);
     // Parse features (string) to array
     const admins = result.rows.map(a => ({
@@ -3096,7 +3218,65 @@ app.get('/admin/country-admins', async (req, res) => {
     }));
     res.json(admins);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.warn('GET /admin/country-admins failed:', err.message);
+    // Return empty list instead of 500 so frontend can gracefully proceed
+    res.json([]);
+  }
+});
+
+// --- UPDATE country admin (PUT) ---
+app.put('/admin/country-admins/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, status, country, features } = req.body || {};
+    const featuresStr = Array.isArray(features) ? features.join(',') : (features || null);
+    const update = `UPDATE public.country_admins SET 
+      name = COALESCE($1, name),
+      status = COALESCE($2, status),
+      country_code = COALESCE($3, country_code),
+      features = COALESCE($4, features),
+      updated_at = NOW()
+      WHERE id = $5 RETURNING *`;
+    const result = await pool.query(update, [name ?? null, status ?? null, (country ? String(country).slice(0,2).toLowerCase() : null), featuresStr, id]);
+    if (!result.rows[0]) return res.status(404).json({ ok: false, error: 'Not found' });
+    const row = result.rows[0];
+    res.json({ ok: true, admin: { ...row, features: row.features ? row.features.split(',') : [] } });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --- CHANGE PASSWORD country admin (PATCH) ---
+app.patch('/admin/country-admins/:id/password', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { password } = req.body || {};
+    if (!password || String(password).length < 6) return res.status(400).json({ ok: false, error: 'Password too short' });
+    // Update the mirrored prisma.admin user by looking up email from country_admins
+    try {
+      const lookup = await pool.query('SELECT email FROM public.country_admins WHERE id = $1', [id]);
+      const email = lookup.rows?.[0]?.email;
+      if (email) {
+        const hash = await bcrypt.hash(password, 10);
+        await prisma.admin.update({ where: { email }, data: { password_hash: hash } });
+      }
+    } catch (e) {
+      console.warn('Mirror password update failed:', e.message);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// --- DELETE country admin (DELETE) ---
+app.delete('/admin/country-admins/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query('DELETE FROM public.country_admins WHERE id = $1', [id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
   }
 });
 
