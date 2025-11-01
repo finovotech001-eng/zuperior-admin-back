@@ -384,8 +384,67 @@ app.patch('/admin/kyc/:id', async (req, res) => {
     if (body.documentReference && !body.documentSubmittedAt) data.documentSubmittedAt = new Date();
     if (body.addressReference && !body.addressSubmittedAt) data.addressSubmittedAt = new Date();
     if (Object.keys(data).length === 0) return res.status(400).json({ ok: false, error: 'No valid fields' });
-    const rec = await prisma.kYC.update({ where: { id }, data, select: { id: true } });
-    res.json({ ok: true, id: rec.id });
+
+    // If the id is synthetic (no-kyc-<userId>), create a new KYC record for that user
+    if (id && id.startsWith('no-kyc-')) {
+      const userId = id.replace('no-kyc-','');
+      try {
+        const created = await prisma.kYC.create({
+          data: {
+            id: crypto.randomUUID(),
+            userId,
+            isDocumentVerified: !!data.isDocumentVerified,
+            isAddressVerified: !!data.isAddressVerified,
+            verificationStatus: data.verificationStatus || 'Pending',
+            documentReference: data.documentReference || null,
+            addressReference: data.addressReference || null,
+            documentSubmittedAt: data.documentSubmittedAt || null,
+            addressSubmittedAt: data.addressSubmittedAt || null,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          },
+          select: { id: true }
+        });
+        return res.json({ ok: true, id: created.id });
+      } catch (e) {
+        console.error('Create KYC for user failed:', e);
+        return res.status(500).json({ ok: false, error: 'Failed to create KYC' });
+      }
+    }
+
+    // Normal update path
+    try {
+      const rec = await prisma.kYC.update({ where: { id }, data, select: { id: true } });
+      return res.json({ ok: true, id: rec.id });
+    } catch (e) {
+      // If not found, but a userId was supplied, create instead
+      if (e && e.code === 'P2025' && body.userId) {
+        try {
+          const created = await prisma.kYC.create({
+            data: {
+              id: crypto.randomUUID(),
+              userId: body.userId,
+              isDocumentVerified: !!data.isDocumentVerified,
+              isAddressVerified: !!data.isAddressVerified,
+              verificationStatus: data.verificationStatus || 'Pending',
+              documentReference: data.documentReference || null,
+              addressReference: data.addressReference || null,
+              documentSubmittedAt: data.documentSubmittedAt || null,
+              addressSubmittedAt: data.addressSubmittedAt || null,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            },
+            select: { id: true }
+          });
+          return res.json({ ok: true, id: created.id });
+        } catch (ce) {
+          console.error('Create KYC after not found failed:', ce);
+          return res.status(500).json({ ok: false, error: 'Failed to create KYC' });
+        }
+      }
+      console.error('PATCH /admin/kyc/:id failed:', e);
+      return res.status(500).json({ ok: false, error: 'Failed to update KYC' });
+    }
   } catch (err) {
     console.error('PATCH /admin/kyc/:id failed:', err);
     res.status(500).json({ ok: false, error: 'Failed to update KYC' });
@@ -1165,6 +1224,22 @@ app.get('/admin/users/:id', async (req, res) => {
   } catch (err) {
     console.error('GET /admin/users/:id failed:', err);
     res.status(500).json({ ok: false, error: 'Failed to get user' });
+  }
+});
+
+// Fetch user login activity from public."UserLoginLog"
+app.get('/admin/users/:id/logins', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const q = `SELECT id, userid, "userId", user_agent, device, browser, success, failure_reason, "createdAt"
+               FROM public."UserLoginLog"
+               WHERE (userid = $1 OR "userId" = $1)
+               ORDER BY "createdAt" DESC`;
+    const result = await pool.query(q, [id]);
+    res.json({ ok: true, items: result.rows || [] });
+  } catch (err) {
+    console.error('GET /admin/users/:id/logins failed:', err);
+    res.json({ ok: true, items: [] });
   }
 });
 
@@ -3164,18 +3239,60 @@ app.post('/admin/country-admins', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields.' });
     }
     const featuresStr = Array.isArray(features) ? features.join(',') : (features || '');
+    // Use the actual table: public.country_admins
+    // Resolve country code from either full name or code (case-insensitive),
+    // and store EXACT value from countries table to satisfy FK
+    let isoInput = String(country || '').trim();
+    let iso = isoInput;
     try {
-      // Use the actual table: public.country_admins
-      const iso = String(country).slice(0,2).toLowerCase();
-      const insert =
-        `INSERT INTO public.country_admins (name, email, status, country_code, features, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, NOW(), NOW()) RETURNING *`;
-      const result = await pool.query(insert, [name, email, status, iso, featuresStr]);
-      var createdRow = result.rows[0];
-    } catch (dbErr) {
-      console.warn('country_admin table write failed:', dbErr.message);
-      // Fall back to returning a synthetic object so the UI can proceed
-      var createdRow = { id: Date.now(), name, email, status, country_code: country, features: featuresStr };
+      const look = await pool.query(
+        'SELECT code FROM public.countries WHERE LOWER(code) = LOWER($1) OR LOWER(country) = LOWER($1) LIMIT 1',
+        [isoInput]
+      );
+      if (look.rows?.[0]?.code) {
+        iso = look.rows[0].code; // use exact code from table (likely uppercase)
+      } else {
+        // As a last resort, truncate to 2 and try again
+        const try2 = await pool.query(
+          'SELECT code FROM public.countries WHERE LOWER(code) = LOWER($1) LIMIT 1',
+          [isoInput.slice(0,2)]
+        );
+        if (try2.rows?.[0]?.code) iso = try2.rows[0].code;
+      }
+    } catch {}
+    if (!iso || iso.length === 0) {
+      return res.status(400).json({ ok: false, error: 'Invalid country or code' });
+    }
+    // Try update-by-email first; if not found, insert a new row
+    const update = `UPDATE public.country_admins
+                    SET name = $1,
+                        status = $3,
+                        country_code = $4,
+                        features = $5
+                    WHERE email = $2
+                    RETURNING *`;
+    let result = await pool.query(update, [name, email, status, iso, featuresStr]);
+    let createdRow = result.rows[0];
+    if (!createdRow) {
+      // Determine next integer id if table doesn't auto-generate
+      let nextId = null;
+      try {
+        const idq = await pool.query('SELECT COALESCE(MAX(id),0)+1 AS id FROM public.country_admins');
+        nextId = idq.rows?.[0]?.id || 1;
+      } catch {}
+      let insert;
+      let params;
+      if (nextId) {
+        insert = `INSERT INTO public.country_admins (id, name, email, status, country_code, features, created_at)
+                  VALUES ($1, $2, $3, $4, $5, $6, NOW()) RETURNING *`;
+        params = [nextId, name, email, status, iso, featuresStr];
+      } else {
+        insert = `INSERT INTO public.country_admins (name, email, status, country_code, features, created_at)
+                  VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING *`;
+        params = [name, email, status, iso, featuresStr];
+      }
+      result = await pool.query(insert, params);
+      createdRow = result.rows[0];
     }
 
     // Mirror account to prisma.admin so the partner can login
@@ -3199,11 +3316,10 @@ app.post('/admin/country-admins', async (req, res) => {
       // do not fail the main request
     }
 
-    res.json({ ok: true, admin: createdRow });
+    res.json({ ok: true, admin: { ...createdRow, features: (createdRow.features ? String(createdRow.features).split(',') : []) } });
   } catch (err) {
-    console.warn('POST /admin/country-admins failed:', err.message);
-    // Return a soft failure so the UI doesn't break; caller may refresh
-    res.json({ ok: false, error: err.message });
+    console.error('POST /admin/country-admins failed:', err);
+    res.status(500).json({ ok: false, error: err.message || 'Insert failed', code: err.code, detail: err.detail });
   }
 });
 // --- READ (GET) all country admins ---
@@ -3230,14 +3346,28 @@ app.put('/admin/country-admins/:id', async (req, res) => {
     const { id } = req.params;
     const { name, status, country, features } = req.body || {};
     const featuresStr = Array.isArray(features) ? features.join(',') : (features || null);
+    // Resolve code from name/code like in POST
+    let isoInput = String(country || '').trim();
+    let iso = null;
+    if (isoInput) {
+      try {
+        const look = await pool.query(
+          'SELECT code FROM public.countries WHERE LOWER(code) = LOWER($1) OR LOWER(country) = LOWER($1) LIMIT 1',
+          [isoInput]
+        );
+        if (look.rows?.[0]?.code) iso = look.rows[0].code; else {
+          const try2 = await pool.query('SELECT code FROM public.countries WHERE LOWER(code) = LOWER($1) LIMIT 1', [isoInput.slice(0,2)]);
+          if (try2.rows?.[0]?.code) iso = try2.rows[0].code;
+        }
+      } catch {}
+    }
     const update = `UPDATE public.country_admins SET 
       name = COALESCE($1, name),
       status = COALESCE($2, status),
       country_code = COALESCE($3, country_code),
-      features = COALESCE($4, features),
-      updated_at = NOW()
+      features = COALESCE($4, features)
       WHERE id = $5 RETURNING *`;
-    const result = await pool.query(update, [name ?? null, status ?? null, (country ? String(country).slice(0,2).toLowerCase() : null), featuresStr, id]);
+    const result = await pool.query(update, [name ?? null, status ?? null, iso, featuresStr, id]);
     if (!result.rows[0]) return res.status(404).json({ ok: false, error: 'Not found' });
     const row = result.rows[0];
     res.json({ ok: true, admin: { ...row, features: row.features ? row.features.split(',') : [] } });
