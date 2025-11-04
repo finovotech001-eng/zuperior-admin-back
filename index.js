@@ -1243,6 +1243,21 @@ app.get('/admin/users/:id/logins', authenticateAdmin, async (req, res) => {
   }
 });
 
+// Get payment methods for a specific user
+app.get('/admin/users/:id/payment-methods', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const paymentMethods = await prisma.paymentMethod.findMany({
+      where: { userId: id, status: 'approved' },
+      orderBy: { approvedAt: 'desc' }
+    });
+    res.json({ ok: true, paymentMethods });
+  } catch (err) {
+    console.error('GET /admin/users/:id/payment-methods failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch payment methods' });
+  }
+});
+
 // Aggregated activity logs endpoint
 app.get('/admin/activity-logs', async (req, res) => {
   try {
