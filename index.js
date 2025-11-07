@@ -109,7 +109,10 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '1mb' }));
 // Static serving for stored KYC proofs
-app.use('/kyc_proofs', express.static(path.join(process.cwd(), 'zuperior-admin-back', 'src', 'kyc_proofs')));
+const proofsDir = path.join(process.cwd(), 'zuperior-admin-back', 'src', 'kyc_proofs');
+app.use('/kyc_proofs', express.static(proofsDir));
+// Backward-compatible: some rows may reference /uploads/... from older saves
+app.use('/uploads', express.static(proofsDir));
 
 // ---- Database ----
 const pool = new Pool({
@@ -2802,66 +2805,113 @@ app.put('/admin/admins/:id/password', authenticateAdmin, async (req, res) => {
 // ---- Manual Gateways Endpoints ----
 app.get('/admin/manual-gateways', authenticateAdmin, async (req, res) => {
   try {
-    const gateways = await prisma.manual_gateway.findMany({
-      orderBy: {
-        created_at: 'desc'
-      }
-    });
-
-    res.json({ ok: true, gateways });
+    const params = [];
+    let where = '';
+    if (req.query.country) {
+      params.push(String(req.query.country).toUpperCase());
+      where = `WHERE country_code = $${params.length} OR country_code IS NULL`;
+    }
+    const sql = `
+      SELECT id, type, name, details, icon_url, qr_code_url, is_active,
+             vpa_address, crypto_address, bank_name, account_name, account_number,
+             ifsc_code, swift_code, account_type, country_code, created_at, updated_at
+      FROM public.manual_gateway
+      ${where}
+      ORDER BY created_at DESC
+    `;
+    const { rows } = await pool.query(sql, params);
+    res.json({ ok: true, gateways: rows });
   } catch (err) {
     console.error('GET /admin/manual-gateways failed:', err);
     res.status(500).json({ ok: false, error: 'Failed to fetch manual gateways' });
   }
 });
 
-app.post('/admin/manual-gateways', authenticateAdmin, async (req, res) => {
+app.post('/admin/manual-gateways', authenticateAdmin, upload.fields([{ name: 'icon', maxCount: 1 }, { name: 'qr_code', maxCount: 1 }]), async (req, res) => {
   try {
-    const { type, name, details, is_active } = req.body;
+    const { type, name, details, is_active,
+      vpa_address, crypto_address,
+      bank_name, account_name, account_number, ifsc_code, swift_code, account_type, country_code
+    } = req.body;
     
     // Handle file uploads
-    const icon_url = req.files?.icon ? `/uploads/${req.files.icon[0].filename}` : null;
-    const qr_code_url = req.files?.qr_code ? `/uploads/${req.files.qr_code[0].filename}` : null;
+    const icon_url = req.files?.icon ? `/kyc_proofs/${path.basename(req.files.icon[0].path)}` : null;
+    const qr_code_url = req.files?.qr_code ? `/kyc_proofs/${path.basename(req.files.qr_code[0].path)}` : null;
     
-    const gateway = await prisma.manual_gateway.create({
-      data: {
-        type,
-        name,
-        details,
-        icon_url,
-        qr_code_url,
-        is_active
-      }
-    });
-
-    res.json({ ok: true, gateway });
+    const sql = `
+      INSERT INTO public.manual_gateway
+        (type, name, details, icon_url, qr_code_url, is_active,
+         vpa_address, crypto_address, bank_name, account_name, account_number,
+         ifsc_code, swift_code, account_type, country_code, created_at, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW(),NOW())
+      RETURNING *
+    `;
+    const params = [
+      String(type),
+      String(name),
+      details ? String(details) : '',
+      icon_url,
+      qr_code_url,
+      (String(is_active) === 'true' || is_active === true || String(is_active).toLowerCase()==='on'),
+      vpa_address || null,
+      crypto_address || null,
+      bank_name || null,
+      account_name || null,
+      account_number || null,
+      ifsc_code || null,
+      swift_code || null,
+      account_type || null,
+      country_code ? String(country_code).toUpperCase() : null,
+    ];
+    const { rows } = await pool.query(sql, params);
+    res.json({ ok: true, gateway: rows[0] });
   } catch (err) {
     console.error('POST /admin/manual-gateways failed:', err);
     res.status(500).json({ ok: false, error: 'Failed to create manual gateway' });
   }
 });
 
-app.put('/admin/manual-gateways/:id', authenticateAdmin, async (req, res) => {
+app.put('/admin/manual-gateways/:id', authenticateAdmin, upload.fields([{ name: 'icon', maxCount: 1 }, { name: 'qr_code', maxCount: 1 }]), async (req, res) => {
   try {
     const { id } = req.params;
-    const { type, name, details, is_active } = req.body;
+    const { type, name, details, is_active,
+      vpa_address, crypto_address,
+      bank_name, account_name, account_number, ifsc_code, swift_code, account_type, country_code
+    } = req.body;
     
     // Handle file uploads
-    const updateData = { type, name, details, is_active };
-    
+    const sets = [
+      'type = $1','name = $2','details = $3','is_active = $4',
+      'vpa_address = $5','crypto_address = $6','bank_name = $7','account_name = $8','account_number = $9',
+      'ifsc_code = $10','swift_code = $11','account_type = $12','country_code = $13','updated_at = NOW()'
+    ];
+    const params = [
+      String(type),
+      String(name),
+      details ? String(details) : '',
+      (String(is_active) === 'true' || is_active === true || String(is_active).toLowerCase()==='on'),
+      vpa_address || null,
+      crypto_address || null,
+      bank_name || null,
+      account_name || null,
+      account_number || null,
+      ifsc_code || null,
+      swift_code || null,
+      account_type || null,
+      country_code ? String(country_code).toUpperCase() : null,
+    ];
     if (req.files?.icon) {
-      updateData.icon_url = `/uploads/${req.files.icon[0].filename}`;
+      sets.push(`icon_url = $${params.length+1}`);
+      params.push(`/kyc_proofs/${path.basename(req.files.icon[0].path)}`);
     }
     if (req.files?.qr_code) {
-      updateData.qr_code_url = `/uploads/${req.files.qr_code[0].filename}`;
+      sets.push(`qr_code_url = $${params.length+1}`);
+      params.push(`/kyc_proofs/${path.basename(req.files.qr_code[0].path)}`);
     }
-    
-    const gateway = await prisma.manual_gateway.update({
-      where: { id: parseInt(id) },
-      data: updateData
-    });
-
-    res.json({ ok: true, gateway });
+    params.push(parseInt(id));
+    const sql = `UPDATE public.manual_gateway SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`;
+    const { rows } = await pool.query(sql, params);
+    res.json({ ok: true, gateway: rows[0] });
   } catch (err) {
     console.error('PUT /admin/manual-gateways/:id failed:', err);
     res.status(500).json({ ok: false, error: 'Failed to update manual gateway' });
@@ -2871,12 +2921,8 @@ app.put('/admin/manual-gateways/:id', authenticateAdmin, async (req, res) => {
 app.delete('/admin/manual-gateways/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    
-    await prisma.manual_gateway.delete({
-      where: { id: parseInt(id) }
-    });
-
-    res.json({ ok: true, message: 'Manual gateway deleted successfully' });
+    const { rowCount } = await pool.query('DELETE FROM public.manual_gateway WHERE id = $1', [parseInt(id)]);
+    res.json({ ok: true, deleted: rowCount });
   } catch (err) {
     console.error('DELETE /admin/manual-gateways/:id failed:', err);
     res.status(500).json({ ok: false, error: 'Failed to delete manual gateway' });
@@ -3523,13 +3569,108 @@ app.post('/admin/admin-transactions', authenticateAdmin, async (req, res) => {
   }
 });
 
-// Temporary: internal transfers endpoint to avoid 404 in UI until implemented
+// Internal transfers from Transaction table
 app.get('/admin/internal-transfers', authenticateAdmin, async (req, res) => {
   try {
-    // Return empty list as a placeholder
-    res.json({ ok: true, total: 0, page: 1, limit: Number(req.query.limit || 100), items: [] });
+    const take = Math.min(parseInt(req.query.limit || '100', 10), 1000);
+    const page = Math.max(parseInt(req.query.page || '1', 10), 1);
+    const skip = (page - 1) * take;
+    const status = req.query.status ? String(req.query.status) : null;
+    const from = req.query.from ? new Date(req.query.from) : null;
+    const to = req.query.to ? new Date(req.query.to) : null;
+    const q = (req.query.q || '').toString().trim();
+
+    const whereParts = ["(\"type\" = 'transfer' OR \"paymentMethod\" = 'internal_transfer')"];
+    const params = [];
+    if (status) { params.push(status); whereParts.push(`"status" = $${params.length}`); }
+    if (from) { params.push(from); whereParts.push(`"createdAt" >= $${params.length}`); }
+    if (to) { params.push(to); whereParts.push(`"createdAt" <= $${params.length}`); }
+    if (q) {
+      params.push(`%${q}%`);
+      whereParts.push(`("description" ILIKE $${params.length} OR "userId" ILIKE $${params.length})`);
+    }
+
+    const whereSQL = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+    const countSql = `SELECT COUNT(1) AS cnt FROM public."Transaction" ${whereSQL}`;
+    const { rows: cntRows } = await pool.query(countSql, params);
+    const total = Number(cntRows?.[0]?.cnt || 0);
+
+    const itemsSql = `
+      SELECT "id","userId","type","amount","status","currency","paymentMethod",
+             "transactionId","description","depositId","withdrawalId","createdAt","updatedAt"
+      FROM public."Transaction"
+      ${whereSQL}
+      ORDER BY "createdAt" DESC
+      LIMIT $${params.length+1} OFFSET $${params.length+2}
+    `;
+    const { rows } = await pool.query(itemsSql, [...params, take, skip]);
+
+    // Group pairs into single transfer rows (from + to)
+    const groups = new Map();
+    const acctIds = new Set();
+    function parseAcc(desc){
+      if (!desc) return {};
+      const mFrom = /from account\s(\d+)/i.exec(desc);
+      const mTo = /to account\s(\d+)/i.exec(desc);
+      return { from: mFrom ? mFrom[1] : null, to: mTo ? mTo[1] : null };
+    }
+    rows.forEach(r => {
+      const t = new Date(r.createdAt).getTime();
+      const bucket = Math.floor(t/1000); // per second bucket
+      const key = `${r.userId}|${r.amount}|${r.currency}|${bucket}`;
+      const acc = parseAcc(r.description);
+      let g = groups.get(key);
+      if (!g) {
+        g = {
+          id: r.id,
+          createdAt: r.createdAt,
+          amount: r.amount,
+          currency: r.currency,
+          status: r.status,
+          fromLogin: null,
+          toLogin: null,
+          notes: []
+        };
+        groups.set(key, g);
+      } else {
+        // keep latest status if either is completed
+        if (r.status === 'completed') g.status = 'completed';
+        if (new Date(r.createdAt) > new Date(g.createdAt)) g.createdAt = r.createdAt;
+      }
+      if (acc.from) { g.fromLogin = acc.from; acctIds.add(acc.from); }
+      if (acc.to)   { g.toLogin   = acc.to;   acctIds.add(acc.to); }
+      if (r.description) g.notes.push(r.description);
+    });
+
+    // Resolve account -> user details
+    const accounts = Array.from(acctIds);
+    const userMap = new Map();
+    if (accounts.length) {
+      try {
+        const accRows = await prisma.mT5Account.findMany({
+          where: { accountId: { in: accounts } },
+          select: { accountId: true, User: { select: { id: true, email: true, name: true } } }
+        });
+        accRows.forEach(a => userMap.set(a.accountId, a.User || null));
+      } catch (e) { console.warn('Lookup MT5Account failed:', e.message); }
+    }
+
+    const items = Array.from(groups.values()).map(g => ({
+      id: g.id,
+      createdAt: g.createdAt,
+      amount: g.amount,
+      currency: g.currency,
+      status: g.status,
+      from: g.fromLogin ? { mt5Login: g.fromLogin, user: userMap.get(g.fromLogin) } : null,
+      to:   g.toLogin   ? { mt5Login: g.toLogin,   user: userMap.get(g.toLogin) }   : null,
+      description: g.notes.join(' | ')
+    }));
+
+    res.json({ ok: true, total: items.length, page, limit: take, items });
   } catch (err) {
-    res.json({ ok: true, total: 0, page: 1, limit: Number(req.query.limit || 100), items: [] });
+    console.error('GET /admin/internal-transfers failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch internal transfers' });
   }
 });
 
@@ -3728,5 +3869,35 @@ app.get('/admin/countries', async (req, res) => {
     res.json({ ok: true, countries: result.rows });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ---------------- User-facing Manual Gateways ----------------
+// Returns active manual gateways eligible for a user's country or a provided ISO country code
+// Usage:
+//   GET /u/manual-gateways?userId=<id>
+//   GET /u/manual-gateways?country=IN
+//   Optional: &type=upi|crypto|wire|local
+app.get('/u/manual-gateways', async (req, res) => {
+  try {
+    const { userId, country, type } = req.query;
+
+    let iso = (country || '').toString().trim().toUpperCase();
+    if (!iso && userId) {
+      try {
+        const user = await prisma.user.findUnique({ where: { id: String(userId) }, select: { country: true } });
+        iso = (user?.country || '').toString().trim().toUpperCase();
+      } catch {}
+    }
+
+    const where = { is_active: true };
+    if (iso) where.OR = [{ country_code: null }, { country_code: iso }];
+    if (type) where.type = String(type);
+
+    const gateways = await prisma.manual_gateway.findMany({ where, orderBy: { created_at: 'desc' } });
+    res.json({ ok: true, country: iso || null, items: gateways });
+  } catch (err) {
+    console.error('GET /u/manual-gateways failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch available gateways' });
   }
 });

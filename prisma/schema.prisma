@@ -369,11 +369,21 @@ model manual_gateway {
   icon_url    String?  @db.VarChar(500)
   qr_code_url String?  @db.VarChar(500)
   is_active   Boolean  @default(true)
+  vpa_address     String?  @db.VarChar(255) // UPI VPA
+  crypto_address  String?  @db.VarChar(255)
+  bank_name       String?  @db.VarChar(255)
+  account_name    String?  @db.VarChar(255)
+  account_number  String?  @db.VarChar(255)
+  ifsc_code       String?  @db.VarChar(50)
+  swift_code      String?  @db.VarChar(50)
+  account_type    String?  @db.VarChar(50)
+  country_code    String?  @db.VarChar(2)   // ISO alpha-2 from countries.code
   created_at  DateTime @default(now()) @db.Timestamptz(6)
   updated_at  DateTime @updatedAt @db.Timestamptz(6)
   
   @@index([type])
   @@index([is_active])
+  @@index([country_code])
 }
 
 model ib_admin {
