@@ -3332,6 +3332,7 @@ app.post('/admin/mt5/credit', authenticateAdmin, async (req, res) => {
         },
         body: JSON.stringify({
           amount: parseFloat(amount),
+          balance: parseFloat(amount),
           comment: description || 'Credit added'
         })
       });
@@ -3345,32 +3346,37 @@ app.post('/admin/mt5/credit', authenticateAdmin, async (req, res) => {
       operationStatus = 'completed'; // Log as completed for demo purposes
     }
     
-    // Log the operation
-    const operation = await prisma.balance_operation_history.create({
-      data: {
-        admin_id: req.adminId,
-        mt5_login: login,
-        operation_type: 'credit',
-        amount: parseFloat(amount),
-        currency: 'USD',
-        description: description || 'Credit added',
-        status: operationStatus,
-        error_message: errorMessage,
-        ip_address: ipAddress,
-        user_agent: userAgent
-      }
-    });
+    // Log the operation (best-effort)
+    let operation = null;
+    try {
+      operation = await prisma.balance_operation_history.create({
+        data: {
+          admin_id: req.adminId,
+          mt5_login: login,
+          operation_type: 'credit',
+          amount: parseFloat(amount),
+          currency: 'USD',
+          description: description || 'Credit added',
+          status: operationStatus,
+          error_message: errorMessage,
+          ip_address: ipAddress,
+          user_agent: userAgent
+        }
+      });
+    } catch (logErr) {
+      console.warn('Balance operation log failed (credit):', logErr.message);
+    }
     
     res.json({ 
       ok: true, 
       message: operationStatus === 'completed' ? 'Credit added successfully' : 'Operation logged but MT5 API unavailable',
       operation: {
-        id: operation.id,
-        login: operation.mt5_login,
-        amount: operation.amount,
-        type: operation.operation_type,
-        status: operation.status,
-        created_at: operation.created_at
+        id: operation?.id || null,
+        login: login,
+        amount: operation?.amount || parseFloat(amount),
+        type: operation?.operation_type || 'credit',
+        status: operation?.status || operationStatus,
+        created_at: operation?.created_at || new Date()
       }
     });
   } catch (err) {
@@ -3409,6 +3415,7 @@ app.post('/admin/mt5/credit/deduct', authenticateAdmin, async (req, res) => {
         },
         body: JSON.stringify({
           amount: parseFloat(amount),
+          balance: parseFloat(amount),
           comment: description || 'Credit deducted'
         })
       });
@@ -3422,32 +3429,37 @@ app.post('/admin/mt5/credit/deduct', authenticateAdmin, async (req, res) => {
       operationStatus = 'completed';
     }
 
-    // Log the operation
-    const operation = await prisma.balance_operation_history.create({
-      data: {
-        admin_id: req.adminId,
-        mt5_login: login,
-        operation_type: 'credit_deduct',
-        amount: parseFloat(amount),
-        currency: 'USD',
-        description: description || 'Credit deducted',
-        status: operationStatus,
-        error_message: errorMessage,
-        ip_address: ipAddress,
-        user_agent: userAgent
-      }
-    });
+    // Log the operation (best-effort)
+    let operation = null;
+    try {
+      operation = await prisma.balance_operation_history.create({
+        data: {
+          admin_id: req.adminId,
+          mt5_login: login,
+          operation_type: 'credit_deduct',
+          amount: parseFloat(amount),
+          currency: 'USD',
+          description: description || 'Credit deducted',
+          status: operationStatus,
+          error_message: errorMessage,
+          ip_address: ipAddress,
+          user_agent: userAgent
+        }
+      });
+    } catch (logErr) {
+      console.warn('Balance operation log failed (credit_deduct):', logErr.message);
+    }
 
     res.json({
       ok: true,
       message: operationStatus === 'completed' ? 'Credit deducted successfully' : 'Operation logged but MT5 API unavailable',
       operation: {
-        id: operation.id,
-        login: operation.mt5_login,
-        amount: operation.amount,
-        type: operation.operation_type,
-        status: operation.status,
-        created_at: operation.created_at
+        id: operation?.id || null,
+        login: login,
+        amount: operation?.amount || parseFloat(amount),
+        type: operation?.operation_type || 'credit_deduct',
+        status: operation?.status || operationStatus,
+        created_at: operation?.created_at || new Date()
       }
     });
   } catch (err) {
