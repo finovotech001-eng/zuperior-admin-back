@@ -255,48 +255,170 @@ app.delete('/admin/users/:id', async (req, res) => {
       return res.status(404).json({ ok: false, error: 'User not found' });
     }
     
-    // Use a transaction to handle related records
+    // Query database for all foreign key constraints that reference User table
+    // This helps identify any constraints we might have missed
+    let fkInfo = [];
+    try {
+      const fkQuery = `
+        SELECT
+          tc.table_name,
+          kcu.column_name,
+          ccu.table_name AS foreign_table_name,
+          ccu.column_name AS foreign_column_name,
+          tc.constraint_name
+        FROM information_schema.table_constraints AS tc
+        JOIN information_schema.key_column_usage AS kcu
+          ON tc.constraint_name = kcu.constraint_name
+          AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage AS ccu
+          ON ccu.constraint_name = tc.constraint_name
+          AND ccu.table_schema = tc.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND ccu.table_name = 'User'
+          AND ccu.column_name = 'id';
+      `;
+      const fkResult = await pool.query(fkQuery);
+      fkInfo = fkResult.rows || [];
+      console.log('Foreign key constraints referencing User:', JSON.stringify(fkInfo, null, 2));
+    } catch (fkErr) {
+      console.warn('Could not query FK constraints:', fkErr);
+    }
+    
+    // First, delete non-Prisma tables using raw SQL (outside transaction to avoid issues)
+    // These tables might not have proper FK constraints but still need cleanup
+    try {
+      // Delete UserLoginLog - this table has both userid and userId columns
+      await pool.query('DELETE FROM "UserLoginLog" WHERE userid = $1 OR "userId" = $1', [id]);
+      
+      // Delete support ticket replies first (they might reference tickets)
+      await pool.query('DELETE FROM support_ticket_replies WHERE sender_id = $1', [id]);
+      await pool.query('DELETE FROM support_replies WHERE sender_id = $1', [id]);
+      // Delete support tickets
+      await pool.query('DELETE FROM support_tickets WHERE user_id = $1', [id]);
+      // Delete chat participants first (they reference conversations)
+      await pool.query('DELETE FROM chat_participants WHERE user_id = $1', [id]);
+      // Delete chat messages where sender_id matches
+      await pool.query('DELETE FROM chat_messages WHERE sender_id = $1', [id]);
+      // Delete chat conversations (cascade should handle the rest)
+      await pool.query('DELETE FROM chat_conversations WHERE user_id = $1', [id]);
+    } catch (sqlErr) {
+      console.warn('Error deleting non-Prisma tables (continuing):', sqlErr);
+    }
+    
+    // Before Prisma transaction, clean up any legacy tables that may reference MT5 accounts
+    try {
+      const mt5Ids = (await prisma.mT5Account.findMany({ where: { userId: id }, select: { id: true } })).map(a => a.id);
+      if (mt5Ids.length) {
+        const candidates = [
+          'DefaultMT5Account',
+          'default_mt5_account',
+          'default_mt5_accounts',
+          'defaultmt5account'
+        ];
+        for (const tbl of candidates) {
+          try {
+            // Try both common column casings
+            await pool.query(`DELETE FROM "${tbl}" WHERE "mt5AccountId" = ANY($1::text[])`, [mt5Ids]);
+          } catch {}
+          try {
+            await pool.query(`DELETE FROM "${tbl}" WHERE "mt5_account_id" = ANY($1::text[])`, [mt5Ids]);
+          } catch {}
+        }
+      }
+    } catch (cleanErr) {
+      console.warn('Warning: could not cleanup legacy default MT5 account mappings:', cleanErr?.message || cleanErr);
+    }
+
+    // Use a transaction to handle Prisma-related records
     await prisma.$transaction(async (tx) => {
       // Delete related records first (in order of dependencies)
       
-      // Delete KYC records
-      await tx.kYC.deleteMany({ where: { userId: id } });
+      // Get deposit and withdrawal IDs first to delete related transactions
+      const depositIds = (await tx.deposit.findMany({ where: { userId: id }, select: { id: true } })).map(d => d.id);
+      const withdrawalIds = (await tx.withdrawal.findMany({ where: { userId: id }, select: { id: true } })).map(w => w.id);
       
-      // Delete activity logs
-      await tx.activityLog.deleteMany({ where: { userId: id } });
+      // Delete transactions that reference deposits/withdrawals OR the user directly
+      const transactionConditions = [{ userId: id }];
+      if (depositIds.length > 0) {
+        transactionConditions.push({ depositId: { in: depositIds } });
+      }
+      if (withdrawalIds.length > 0) {
+        transactionConditions.push({ withdrawalId: { in: withdrawalIds } });
+      }
+      if (transactionConditions.length > 1) {
+        await tx.transaction.deleteMany({ where: { OR: transactionConditions } });
+      } else {
+        await tx.transaction.deleteMany({ where: { userId: id } });
+      }
       
-      // Delete user roles
-      await tx.userRole.deleteMany({ where: { userId: id } });
+      // Delete MT5 transactions (if userId is set) - these reference MT5Account
+      await tx.mT5Transaction.deleteMany({ where: { userId: id } });
       
-      // Delete MT5 accounts
-      await tx.mT5Account.deleteMany({ where: { userId: id } });
-      
-      // Delete transactions
-      await tx.transaction.deleteMany({ where: { userId: id } });
-      
-      // Delete deposits
+      // Delete deposits (these reference MT5Account)
       await tx.deposit.deleteMany({ where: { userId: id } });
       
-      // Delete withdrawals
+      // Delete withdrawals (these reference MT5Account)
       await tx.withdrawal.deleteMany({ where: { userId: id } });
+      
+      // Delete MT5 accounts (after deposits/withdrawals that reference them)
+      await tx.mT5Account.deleteMany({ where: { userId: id } });
+      
+      // Delete accounts
+      await tx.account.deleteMany({ where: { userId: id } });
       
       // Delete payment methods
       await tx.paymentMethod.deleteMany({ where: { userId: id } });
       
+      // Delete KYC records (unique foreign key)
+      await tx.kYC.deleteMany({ where: { userId: id } });
+      
+      // Delete activity logs (both where user is the subject and where user is the admin)
+      await tx.activityLog.deleteMany({ 
+        where: { 
+          OR: [
+            { userId: id },
+            { adminId: id }
+          ]
+        } 
+      });
+      
+      // Delete user roles
+      await tx.userRole.deleteMany({ where: { userId: id } });
+      
       // Finally delete the user
       await tx.user.delete({ where: { id } });
+    }, {
+      timeout: 30000, // Increase timeout to 30 seconds for large deletions
+      isolationLevel: 'ReadCommitted'
     });
     
     console.log(`✅ User ${id} deleted successfully`);
     res.json({ ok: true, message: 'User deleted successfully' });
   } catch (err) {
     console.error('DELETE /admin/users/:id failed:', err);
+    console.error('Error details:', {
+      code: err.code,
+      message: err.message,
+      meta: err.meta,
+      stack: err.stack
+    });
     
-    // Handle specific Prisma errors
-    if (err.code === 'P2003') {
+    // If it's a foreign key constraint error, try to get more details
+    if (err.code === 'P2003' || (err.message && err.message.includes('violates foreign key constraint'))) {
+      // Try to identify the constraint
+      const constraintInfo = err.meta?.field_name || err.meta?.target || err.meta?.constraint || 'unknown constraint';
+      const tableName = err.meta?.table_name || 'unknown table';
+      
+      // Log detailed error for debugging
+      console.error('Constraint violation details:', {
+        constraint: constraintInfo,
+        table: tableName,
+        meta: err.meta
+      });
+      
       return res.status(400).json({ 
         ok: false, 
-        error: 'Cannot delete user: Related records still exist. Please contact support.' 
+        error: `Cannot delete user: Related records still exist in ${tableName} (constraint: ${constraintInfo}). Please contact support.` 
       });
     }
     
@@ -1073,9 +1195,10 @@ app.get('/admin/withdrawals', authenticateAdmin, async (req, res) => {
 });
 
 // Approve withdrawal
-app.post('/admin/withdrawals/:id/approve', async (req, res) => {
+app.post('/admin/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
+    const externalId = (req.body?.externalTransactionId || req.body?.transactionId || req.body?.tx || req.body?.hash || '').toString().trim();
 
     const withdrawal = await prisma.withdrawal.findUnique({
       where: { id },
@@ -1097,7 +1220,7 @@ app.post('/admin/withdrawals/:id/approve', async (req, res) => {
       // Update withdrawal status to approved
       await prisma.withdrawal.update({
         where: { id },
-        data: { status: 'approved', approvedAt: new Date() },
+        data: { status: 'approved', approvedAt: new Date(), approvedBy: String(req.adminId || ''), ...(externalId ? { externalTransactionId: externalId } : {}) },
       });
 
       res.json({
@@ -1113,8 +1236,34 @@ app.post('/admin/withdrawals/:id/approve', async (req, res) => {
   }
 });
 
+// Reject withdrawal
+app.post('/admin/withdrawals/:id/reject', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reason = (req.body?.reason || req.body?.rejectionReason || '').toString().trim();
+
+    const withdrawal = await prisma.withdrawal.findUnique({ where: { id } });
+    if (!withdrawal) return res.status(404).json({ ok: false, error: 'Withdrawal not found' });
+    if (withdrawal.status !== 'pending') return res.status(400).json({ ok: false, error: 'Withdrawal not pending' });
+
+    await prisma.withdrawal.update({
+      where: { id },
+      data: {
+        status: 'rejected',
+        rejectionReason: reason || 'Rejected',
+        rejectedAt: new Date(),
+      },
+    });
+
+    res.json({ ok: true, message: 'Withdrawal rejected successfully.' });
+  } catch (err) {
+    console.error('POST /admin/withdrawals/:id/reject failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to reject withdrawal' });
+  }
+});
+
 // Approve deposit
-app.post('/admin/deposits/:id/approve', async (req, res) => {
+app.post('/admin/deposits/:id/approve', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -1138,7 +1287,7 @@ app.post('/admin/deposits/:id/approve', async (req, res) => {
       // Update deposit status to approved
       await prisma.deposit.update({
         where: { id },
-        data: { status: 'approved', approvedAt: new Date() },
+        data: { status: 'approved', approvedAt: new Date(), approvedBy: String(req.adminId || '') },
       });
 
       res.json({
@@ -3234,6 +3383,153 @@ app.get('/admin/mt5/balance-history', authenticateAdmin, async (req, res) => {
   } catch (err) {
     console.error('GET /admin/mt5/balance-history failed:', err);
     res.status(500).json({ ok: false, error: 'Failed to fetch balance history' });
+  }
+});
+
+// Admin transactions consolidated report (deposit/withdraw/bonus_add/bonus_deduct)
+app.get('/admin/admin-transactions', authenticateAdmin, async (req, res) => {
+  try {
+    const {
+      page = 1,
+      limit = 100,
+      operation_type,
+      status,
+      login,
+      admin_id,
+      from,
+      to,
+      q,
+    } = req.query;
+
+    const take = Math.min(parseInt(limit, 10) || 100, 1000);
+    const curPage = Math.max(parseInt(page, 10) || 1, 1);
+    const offset = (curPage - 1) * take;
+
+    const whereParts = [];
+    const params = [];
+
+    if (operation_type) { params.push(String(operation_type)); whereParts.push(`t.operation_type = $${params.length}`); }
+    if (status) { params.push(String(status)); whereParts.push(`t.status = $${params.length}`); }
+    if (login) { params.push(String(login)); whereParts.push(`t.mt5_login = $${params.length}`); }
+    if (admin_id) { params.push(parseInt(admin_id, 10)); whereParts.push(`t.admin_id = $${params.length}`); }
+    if (from) { params.push(new Date(from)); whereParts.push(`t.created_at >= $${params.length}`); }
+    if (to) { params.push(new Date(to)); whereParts.push(`t.created_at <= $${params.length}`); }
+    if (q) {
+      params.push(`%${q}%`);
+      whereParts.push(`(
+        t.mt5_login ILIKE $${params.length} OR
+        COALESCE(t.external_transaction_id,'') ILIKE $${params.length} OR
+        COALESCE(u.email,'') ILIKE $${params.length} OR
+        COALESCE(a.email,'') ILIKE $${params.length}
+      )`);
+    }
+
+    const whereSql = whereParts.length ? `WHERE ${whereParts.join(' AND ')}` : '';
+
+    const baseSql = `
+      FROM admin_transactions t
+      LEFT JOIN admin a ON a.id = t.admin_id
+      LEFT JOIN "User" u ON u.id = t.user_id
+      LEFT JOIN "MT5Account" m ON m.id = t.mt5_account_id
+      ${whereSql}
+    `;
+
+    const countSql = `SELECT COUNT(1) AS cnt ${baseSql}`;
+    const itemsSql = `
+      SELECT 
+        t.*, 
+        a.email AS admin_email, a.admin_role AS admin_role, a.username AS admin_username,
+        u.email AS user_email, u.name AS user_name,
+        m."accountId" AS mt5_accountid
+      ${baseSql}
+      ORDER BY t.created_at DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+    `;
+
+    const countRes = await pool.query(countSql, params);
+    const total = Number(countRes.rows?.[0]?.cnt || 0);
+
+    const itemsRes = await pool.query(itemsSql, [...params, take, offset]);
+    const items = itemsRes.rows || [];
+
+    res.json({ ok: true, total, page: curPage, limit: take, items });
+  } catch (err) {
+    console.error('GET /admin/admin-transactions failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to fetch admin transactions' });
+  }
+});
+
+// Log an admin transaction (deposit/withdraw/bonus_add/bonus_deduct)
+app.post('/admin/admin-transactions', authenticateAdmin, async (req, res) => {
+  try {
+    const adminId = req.adminId;
+    const {
+      operation_type,
+      mt5_login,
+      amount,
+      currency = 'USD',
+      status = 'completed',
+      comment = '',
+      external_transaction_id = null,
+    } = req.body || {};
+
+    if (!operation_type || !['deposit','withdraw','bonus_add','bonus_deduct'].includes(String(operation_type))) {
+      return res.status(400).json({ ok: false, error: 'Invalid operation_type' });
+    }
+    if (!mt5_login) return res.status(400).json({ ok: false, error: 'mt5_login required' });
+    const amt = Number(amount);
+    if (!amt || !(amt > 0)) return res.status(400).json({ ok: false, error: 'amount must be > 0' });
+
+    // Try to resolve user_id and mt5_account_id
+    let userId = null, mt5AccountId = null;
+    try {
+      const acc = await prisma.mT5Account.findFirst({
+        where: { accountId: String(mt5_login) },
+        select: { id: true, userId: true }
+      });
+      if (acc) { mt5AccountId = acc.id; userId = acc.userId || null; }
+    } catch {}
+
+    // Insert via SQL for compatibility
+    const sql = `
+      INSERT INTO admin_transactions
+        (admin_id, user_id, mt5_account_id, mt5_login, operation_type, amount, currency, status,
+         comment, external_transaction_id, ip_address, user_agent, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+              $9, $10, $11, $12, NOW(), NOW())
+      RETURNING *
+    `;
+    const ip = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').toString().split(',')[0].trim();
+    const ua = req.headers['user-agent'] || '';
+    const params = [
+      parseInt(adminId, 10) || adminId,
+      userId,
+      mt5AccountId,
+      String(mt5_login),
+      String(operation_type),
+      amt,
+      String(currency),
+      String(status),
+      comment ? String(comment) : null,
+      external_transaction_id ? String(external_transaction_id) : null,
+      ip || null,
+      ua || null,
+    ];
+    const { rows } = await pool.query(sql, params);
+    res.json({ ok: true, item: rows?.[0] || null });
+  } catch (err) {
+    console.error('POST /admin/admin-transactions failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to log admin transaction' });
+  }
+});
+
+// Temporary: internal transfers endpoint to avoid 404 in UI until implemented
+app.get('/admin/internal-transfers', authenticateAdmin, async (req, res) => {
+  try {
+    // Return empty list as a placeholder
+    res.json({ ok: true, total: 0, page: 1, limit: Number(req.query.limit || 100), items: [] });
+  } catch (err) {
+    res.json({ ok: true, total: 0, page: 1, limit: Number(req.query.limit || 100), items: [] });
   }
 });
 
