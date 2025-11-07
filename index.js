@@ -2006,90 +2006,75 @@ app.get('/admin/verify', async (req, res) => {
 app.get('/admin/payment-methods', authenticateAdmin, async (req, res) => {
   const q = (req.query.q || '').toString().trim().toLowerCase();
   try {
-    // Try Prisma first (fast path). If both lists come back empty, fall back.
-    try {
-      const [pending, approved] = await Promise.all([
-        prisma.paymentMethod.findMany({ where: { status: 'pending' }, orderBy: { submittedAt: 'desc' } }),
-        prisma.paymentMethod.findMany({ where: { status: 'approved' }, orderBy: { approvedAt: 'desc' } }),
-      ]);
-
-      if ((pending?.length || 0) + (approved?.length || 0) > 0) {
-        // Best-effort user lookup
-        let userMap = {};
-        try {
-          const userIds = Array.from(new Set([...pending, ...approved].map(p => p.userId).filter(Boolean)));
-          if (userIds.length) {
-            const users = await prisma.user.findMany({ where: { id: { in: userIds } }, select: { id: true, email: true, name: true } });
-            userMap = Object.fromEntries(users.map(u => [u.id, u]));
-          }
-        } catch {}
-
-        const mapRow = (row) => ({ ...row, user: userMap[row.userId] || null });
-        const pendingOut = pending.map(mapRow);
-        const approvedOut = approved.map(mapRow);
-
-        const applyFilter = (arr) => (
-          q ? arr.filter(r => (
-            (r.user?.email || '').toLowerCase().includes(q) ||
-            (r.address || '').toLowerCase().includes(q) ||
-            (r.currency || '').toLowerCase().includes(q) ||
-            (r.network || '').toLowerCase().includes(q)
-          )) : arr
-        );
-
-        return res.json({ ok: true, pending: applyFilter(pendingOut), approved: applyFilter(approvedOut) });
-      }
-      console.warn('Prisma returned empty lists for /admin/payment-methods; using raw SQL fallback.');
-    } catch (prismaErr) {
-      console.warn('Prisma failed for /admin/payment-methods, falling back to raw SQL:', prismaErr.message);
-    }
-
-    // Raw SQL fallback compatible with schemas where column is `userid` instead of `userId`
-    const { rows } = await pool.query(`
-      SELECT 
-        pm.*, 
-        u.email AS user_email, 
-        u.name AS user_name
+    // Raw SQL using exact column names from your schema
+    const sql = `
+      SELECT
+        pm."id",
+        pm."userId",
+        pm."address",
+        pm."currency",
+        pm."network",
+        pm."status",
+        pm."submittedAt",
+        pm."approvedAt",
+        pm."approvedBy",
+        pm."rejectionReason",
+        pm."createdAt",
+        pm."updatedAt",
+        pm."methodType",
+        pm."bankName",
+        pm."accountName",
+        pm."accountNumber",
+        pm."ifscSwiftCode",
+        pm."accountType",
+        u.email AS user_email,
+        u.name  AS user_name
       FROM public."PaymentMethod" pm
-      LEFT JOIN public."User" u 
-        ON u.id = pm.userid 
-        OR u.id = pm."userId"
+      LEFT JOIN public."User" u ON u.id = pm."userId"
       ORDER BY COALESCE(pm."submittedAt", pm."createdAt") DESC
-    `);
+    `;
+    const { rows } = await pool.query(sql);
 
     const mapRow = (r) => ({
       id: r.id,
-      userId: r.userId || r.userid || null,
-      address: r.address || '',
-      currency: r.currency || '',
-      network: r.network || '',
-      status: r.status || '',
-      submittedAt: r.submittedat || r.submittedAt || null,
-      approvedAt: r.approvedat || r.approvedAt || null,
-      approvedBy: r.approvedby || r.approvedBy || null,
-      rejectionReason: r.rejectionreason || r.rejectionReason || null,
-      createdAt: r.createdat || r.createdAt || null,
-      updatedAt: r.updatedat || r.updatedAt || null,
-      methodType: r.methodtype || r.methodType || null,
-      label: r.label || null,
-      bankName: r.bankname || r.bankName || null,
-      accountName: r.accountname || r.accountName || null,
-      accountNumber: r.accountnumber || r.accountNumber || null,
-      ifscSwiftCode: r.ifscswiftcode || r.ifscSwiftCode || null,
-      accountType: r.accounttype || r.accountType || null,
-      user: (r.user_email || r.user_name) ? { id: r.userId || r.userid || null, email: r.user_email || null, name: r.user_name || null } : null,
+      userId: r.userId,
+      address: r.address ?? null,
+      currency: r.currency ?? null,
+      network: r.network ?? null,
+      status: r.status ?? null,
+      submittedAt: r.submittedAt ?? null,
+      approvedAt: r.approvedAt ?? null,
+      approvedBy: r.approvedBy ?? null,
+      rejectionReason: r.rejectionReason ?? null,
+      createdAt: r.createdAt ?? null,
+      updatedAt: r.updatedAt ?? null,
+      methodType: r.methodType ?? null,
+      label: r.label ?? null,
+      bankName: r.bankName ?? null,
+      accountName: r.accountName ?? null,
+      accountNumber: r.accountNumber ?? null,
+      ifscSwiftCode: r.ifscSwiftCode ?? null,
+      accountType: r.accountType ?? null,
+      user: (r.user_email || r.user_name) ? { id: r.userId || null, email: r.user_email || null, name: r.user_name || null } : null,
     });
 
     const all = rows.map(mapRow);
-    const pendingOut = all.filter(r => String(r.status).toLowerCase() === 'pending');
-    const approvedOut = all.filter(r => String(r.status).toLowerCase() === 'approved');
+    const pendingOut = all.filter(r => String(r.status||'').toLowerCase() === 'pending');
+    const approvedOut = all.filter(r => String(r.status||'').toLowerCase() === 'approved');
 
     const applyFilter = (arr) => (
       q ? arr.filter(r => (
         (r.user?.email || '').toLowerCase().includes(q) ||
         (r.address || '').toLowerCase().includes(q) ||
         (r.currency || '').toLowerCase().includes(q) ||
-        (r.network || '').toLowerCase().includes(q)
+        (r.network || '').toLowerCase().includes(q) ||
+        (r.status || '').toLowerCase().includes(q) ||
+        (r.methodType || '').toLowerCase().includes(q) ||
+        (r.bankName || '').toLowerCase().includes(q) ||
+        (r.accountName || '').toLowerCase().includes(q) ||
+        (r.accountNumber || '').toLowerCase().includes(q) ||
+        (r.ifscSwiftCode || '').toLowerCase().includes(q) ||
+        (r.accountType || '').toLowerCase().includes(q)
       )) : arr
     );
 
@@ -2303,25 +2288,15 @@ app.put('/admin/payment-methods/:id/approve', authenticateAdmin, async (req, res
   try {
     const { id } = req.params;
     const adminId = req.adminId;
-    const now = new Date();
-    try {
-      const updated = await prisma.paymentMethod.update({
-        where: { id },
-        data: { status: 'approved', approvedAt: now, approvedBy: String(adminId), updatedAt: now },
-      });
-      return res.json({ ok: true, item: updated });
-    } catch (e) {
-      console.warn('Prisma approve failed, attempting raw SQL update:', e.message);
-      const sql = `
-        UPDATE public."PaymentMethod"
-        SET status = 'approved', "approvedAt" = NOW(), "approvedBy" = $2, "updatedAt" = NOW()
-        WHERE id = $1
-        RETURNING *
-      `;
-      const { rows } = await pool.query(sql, [id, String(adminId)]);
-      if (!rows || rows.length === 0) return res.status(404).json({ ok: false, error: 'Payment method not found' });
-      return res.json({ ok: true, item: rows[0] });
-    }
+    const sql = `
+      UPDATE public."PaymentMethod"
+      SET status = 'approved', "approvedAt" = NOW(), "approvedBy" = $2, "updatedAt" = NOW()
+      WHERE id = $1
+      RETURNING *
+    `;
+    const { rows } = await pool.query(sql, [id, String(adminId)]);
+    if (!rows || rows.length === 0) return res.status(404).json({ ok: false, error: 'Payment method not found' });
+    return res.json({ ok: true, item: rows[0] });
   } catch (err) {
     console.error('PUT /admin/payment-methods/:id/approve failed:', err);
     res.status(500).json({ ok: false, error: 'Failed to approve payment method' });
@@ -2333,25 +2308,15 @@ app.put('/admin/payment-methods/:id/reject', authenticateAdmin, async (req, res)
   try {
     const { id } = req.params;
     const { reason } = req.body || {};
-    const now = new Date();
-    try {
-      const updated = await prisma.paymentMethod.update({
-        where: { id },
-        data: { status: 'rejected', rejectionReason: reason || 'Rejected', updatedAt: now },
-      });
-      return res.json({ ok: true, item: updated });
-    } catch (e) {
-      console.warn('Prisma reject failed, attempting raw SQL update:', e.message);
-      const sql = `
-        UPDATE public."PaymentMethod"
-        SET status = 'rejected', "rejectionReason" = $2, "updatedAt" = NOW()
-        WHERE id = $1
-        RETURNING *
-      `;
-      const { rows } = await pool.query(sql, [id, reason || 'Rejected']);
-      if (!rows || rows.length === 0) return res.status(404).json({ ok: false, error: 'Payment method not found' });
-      return res.json({ ok: true, item: rows[0] });
-    }
+    const sql = `
+      UPDATE public."PaymentMethod"
+      SET status = 'rejected', "rejectionReason" = $2, "updatedAt" = NOW()
+      WHERE id = $1
+      RETURNING *
+    `;
+    const { rows } = await pool.query(sql, [id, reason || 'Rejected']);
+    if (!rows || rows.length === 0) return res.status(404).json({ ok: false, error: 'Payment method not found' });
+    return res.json({ ok: true, item: rows[0] });
   } catch (err) {
     console.error('PUT /admin/payment-methods/:id/reject failed:', err);
     res.status(500).json({ ok: false, error: 'Failed to reject payment method' });
