@@ -3379,6 +3379,83 @@ app.post('/admin/mt5/credit', authenticateAdmin, async (req, res) => {
   }
 });
 
+// Deduct credit from MT5 account
+app.post('/admin/mt5/credit/deduct', authenticateAdmin, async (req, res) => {
+  try {
+    const { login, amount, description } = req.body;
+    const ipAddress = getRealIP(req);
+    const userAgent = req.headers['user-agent'] || '';
+
+    if (!login || !amount) {
+      return res.status(400).json({ ok: false, error: 'Login and amount are required' });
+    }
+
+    if (amount <= 0) {
+      return res.status(400).json({ ok: false, error: 'Amount must be positive' });
+    }
+
+    const mt5ApiUrl = process.env.MT5_API_URL || 'http://localhost:8080';
+    const mt5ApiKey = process.env.MT5_API_KEY || 'your-mt5-api-key';
+
+    let operationStatus = 'completed';
+    let errorMessage = null;
+
+    try {
+      const mt5Response = await fetch(`${mt5ApiUrl}/api/Users/${login}/DeductClientCredit`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${mt5ApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          amount: parseFloat(amount),
+          comment: description || 'Credit deducted'
+        })
+      });
+
+      if (!mt5Response.ok) {
+        operationStatus = 'failed';
+        errorMessage = 'MT5 API call failed';
+      }
+    } catch (mt5Error) {
+      console.log('MT5 API not available, logging operation anyway');
+      operationStatus = 'completed';
+    }
+
+    // Log the operation
+    const operation = await prisma.balance_operation_history.create({
+      data: {
+        admin_id: req.adminId,
+        mt5_login: login,
+        operation_type: 'credit_deduct',
+        amount: parseFloat(amount),
+        currency: 'USD',
+        description: description || 'Credit deducted',
+        status: operationStatus,
+        error_message: errorMessage,
+        ip_address: ipAddress,
+        user_agent: userAgent
+      }
+    });
+
+    res.json({
+      ok: true,
+      message: operationStatus === 'completed' ? 'Credit deducted successfully' : 'Operation logged but MT5 API unavailable',
+      operation: {
+        id: operation.id,
+        login: operation.mt5_login,
+        amount: operation.amount,
+        type: operation.operation_type,
+        status: operation.status,
+        created_at: operation.created_at
+      }
+    });
+  } catch (err) {
+    console.error('POST /admin/mt5/credit/deduct failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to deduct credit' });
+  }
+});
+
 // Get balance operation history
 app.get('/admin/mt5/balance-history', authenticateAdmin, async (req, res) => {
   try {
