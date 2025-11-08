@@ -1281,44 +1281,16 @@ app.get('/admin/withdrawals', authenticateAdmin, async (req, res) => {
   }
 });
 
-// Approve withdrawal
+// Approve withdrawal (wallet-only; no MT5 deduction)
 app.post('/admin/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const externalId = (req.body?.externalTransactionId || req.body?.transactionId || req.body?.tx || req.body?.hash || '').toString().trim();
 
-    const withdrawal = await prisma.withdrawal.findUnique({
-      where: { id },
-      include: { MT5Account: true },
-    });
-
+    const withdrawal = await prisma.withdrawal.findUnique({ where: { id } });
     if (!withdrawal) return res.status(404).json({ ok: false, error: 'Withdrawal not found' });
     if (withdrawal.status !== 'pending') return res.status(400).json({ ok: false, error: 'Withdrawal not pending' });
 
-    // Try server-to-server MT5 withdraw; do not fail approval if MT5 is unreachable
-    const mt5ApiUrl = process.env.MT5_API_URL || 'http://18.175.242.21:5003';
-    const mt5ApiKey = process.env.MT5_API_KEY || 'your-mt5-api-key';
-    let mt5Ok = false;
-    try {
-      const mt5Resp = await fetch(`${mt5ApiUrl}/api/Users/${withdrawal.MT5Account.accountId}/DeductClientBalance`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${mt5ApiKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({ balance: parseFloat(withdrawal.amount), amount: parseFloat(withdrawal.amount), comment: 'WITHDRAWAL' }),
-        // Node fetch default timeout may be high; rely on infra timeouts
-      });
-      if (mt5Resp.ok) {
-        let j = null;
-        try { j = await mt5Resp.json(); } catch {}
-        mt5Ok = !j || j.Success !== false; // treat as ok unless explicit failure
-      }
-    } catch (e) {
-      console.warn('MT5 withdraw call failed; approving anyway:', e.message);
-    }
-
-    // Update withdrawal as approved regardless of MT5 call outcome to avoid 500s in prod
     await prisma.withdrawal.update({
       where: { id },
       data: {
@@ -1329,13 +1301,7 @@ app.post('/admin/withdrawals/:id/approve', authenticateAdmin, async (req, res) =
       },
     });
 
-    return res.json({
-      ok: true,
-      mt5Ok,
-      message: mt5Ok
-        ? 'Withdrawal approved and MT5 deduction requested.'
-        : 'Withdrawal approved. MT5 not reachable; please verify balance manually.'
-    });
+    return res.json({ ok: true, message: 'Withdrawal approved (wallet flow). No MT5 deduction performed.' });
   } catch (err) {
     console.error('POST /admin/withdrawals/:id/approve failed:', err?.message || err);
     res.status(500).json({ ok: false, error: 'Failed to approve withdrawal' });
@@ -2212,6 +2178,82 @@ app.get('/admin/payment-methods', authenticateAdmin, async (req, res) => {
     console.error('GET /admin/payment-methods failed (outer):', err);
     // Never 500 for this listing; return empty lists to keep UI working
     res.json({ ok: true, pending: [], approved: [] });
+  }
+});
+
+// Wallet transactions report
+app.get('/admin/wallet-transactions', authenticateAdmin, async (req, res) => {
+  try {
+    const take = Math.min(parseInt(req.query.limit || '1000', 10), 5000);
+    const q = (req.query.q || '').toString().toLowerCase();
+    const sql = `
+      SELECT wt.*, u.email AS user_email, u.name AS user_name
+      FROM public."WalletTransaction" wt
+      LEFT JOIN public."User" u ON u.id = wt."userId"
+      ORDER BY COALESCE(wt."createdAt", wt."updatedAt") DESC
+      LIMIT $1
+    `;
+    const { rows } = await pool.query(sql, [take]);
+    // Build wallet label map from payment_gateway table
+    let walletLabelMap = new Map();
+    try {
+      const walletIds = Array.from(new Set(rows.map(r => (r.walletid || r.walletId || '').toString()).filter(Boolean)));
+      if (walletIds.length) {
+        const { rows: wrows } = await pool.query(
+          `SELECT id::text as id, wallet_name, deposit_wallet_address
+           FROM public.payment_gateway
+           WHERE deposit_wallet_address = ANY($1) OR id::text = ANY($1)`,
+          [walletIds]
+        );
+        for (const w of wrows) {
+          if (w.deposit_wallet_address) walletLabelMap.set(w.deposit_wallet_address, w.wallet_name || w.deposit_wallet_address);
+          if (w.id) walletLabelMap.set(w.id, w.wallet_name || w.deposit_wallet_address || w.id);
+        }
+      }
+    } catch {}
+
+    let items = rows.map(r => {
+      const walletId = r.walletid || r.walletId || null;
+      const walletLabel = walletLabelMap.get(String(walletId)) || walletId || null;
+      const mt5Id = r.mt5accountid || r.mt5AccountId || null;
+      const type = r.type || null;
+      let description = r.description || null;
+      if (!description || /undefined/i.test(String(description))) {
+        if (type === 'MT5_TO_WALLET') description = `From MT5 ${mt5Id || '-'} to Wallet ${walletLabel || walletId || '-'}`;
+        else if (type === 'WALLET_TO_MT5') description = `From Wallet ${walletLabel || walletId || '-'} to MT5 ${mt5Id || '-'}`;
+        else description = `Wallet transaction ${type || ''}`.trim();
+      }
+      return {
+        id: r.id,
+        walletId,
+        walletLabel,
+        userId: r.userid || r.userId || null,
+        userEmail: r.user_email || null,
+        userName: r.user_name || null,
+        type,
+        amount: Number(r.amount || 0),
+        status: r.status || null,
+        description,
+        mt5AccountId: mt5Id,
+        withdrawalId: r.withdrawalid || r.withdrawalId || null,
+        createdAt: r.createdat || r.createdAt || null,
+        updatedAt: r.updatedat || r.updatedAt || null,
+      };
+    });
+    if (q) {
+      items = items.filter(r => (
+        (r.userEmail || '').toLowerCase().includes(q) ||
+        (r.userName || '').toLowerCase().includes(q) ||
+        (r.type || '').toLowerCase().includes(q) ||
+        (r.status || '').toLowerCase().includes(q) ||
+        (r.description || '').toLowerCase().includes(q) ||
+        (r.mt5AccountId || '').toLowerCase().includes(q)
+      ));
+    }
+    res.json({ ok: true, items });
+  } catch (err) {
+    console.error('GET /admin/wallet-transactions failed:', err);
+    res.json({ ok: true, items: [] });
   }
 });
 
