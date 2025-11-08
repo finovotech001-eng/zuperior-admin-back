@@ -1138,7 +1138,7 @@ app.get('/admin/deposits', authenticateAdmin, async (req, res) => {
       ...(country ? { User: { country } } : {}),
     };
 
-    const [total, totalSum, items] = await Promise.all([
+    const [total, totalSum, itemsRaw] = await Promise.all([
       prisma.deposit.count({ where }),
       prisma.deposit.aggregate({ where, _sum: { amount: true } }),
       prisma.deposit.findMany({
@@ -1147,11 +1147,51 @@ app.get('/admin/deposits', authenticateAdmin, async (req, res) => {
         skip,
         take,
         include: {
-          User: { select: { id: true, email: true, name: true } },
+          User: { select: { id: true, email: true, name: true, country: true } },
           MT5Account: { select: { id: true, accountId: true } },
         },
       }),
     ]);
+
+    // Fetch active manual bank gateways (global + by country)
+    let gatewayMap = new Map();
+    try {
+      const { rows } = await pool.query(
+        `SELECT type, name, bank_name, account_name, account_number, ifsc_code, swift_code, account_type, country_code, is_active
+         FROM public.manual_gateway
+         WHERE is_active = true
+         ORDER BY created_at DESC`
+      );
+      for (const g of rows || []) {
+        const key = (g.country_code || '').toUpperCase() || null;
+        if (!gatewayMap.has(key)) gatewayMap.set(key, g); // first (latest) per country
+      }
+    } catch (e) {
+      // non-fatal; proceed without manual gateway enrichment
+      gatewayMap = new Map();
+    }
+
+    function fmtBank(g) {
+      if (!g) return null;
+      const parts = [];
+      if (g.bank_name) parts.push(`Bank: ${g.bank_name}`);
+      if (g.account_name) parts.push(`Account: ${g.account_name}`);
+      if (g.account_number) parts.push(`Number: ${g.account_number}`);
+      const isfcswift = g.ifsc_code || g.swift_code;
+      if (isfcswift) parts.push(`IFSC/SWIFT: ${isfcswift}`);
+      if (g.account_type) parts.push(`Type: ${g.account_type}`);
+      if (g.country_code) parts.push(`Country: ${g.country_code}`);
+      return parts.join(' | ');
+    }
+
+    const items = itemsRaw.map((d) => {
+      const country = (d?.User?.country || '').toUpperCase() || null;
+      const gw = gatewayMap.get(country) || gatewayMap.get(null) || null;
+      const isManualBank = String(d?.method || '').toLowerCase() === 'manual'
+        || ['bank','wire','bank_transfer','bank transfer'].includes(String(d?.paymentMethod || '').toLowerCase());
+      const bankDetails = isManualBank ? (fmtBank(gw) || d.bankDetails || null) : (d.bankDetails || null);
+      return { ...d, bankDetails };
+    });
 
     res.json({ ok: true, total, totalSum: Number(totalSum._sum.amount || 0), page, limit: take, items });
   } catch (err) {
@@ -1322,6 +1362,32 @@ app.post('/admin/deposits/:id/approve', authenticateAdmin, async (req, res) => {
   } catch (err) {
     console.error('POST /admin/deposits/:id/approve failed:', err);
     res.status(500).json({ ok: false, error: 'Failed to approve deposit' });
+  }
+});
+
+// Reject deposit
+app.post('/admin/deposits/:id/reject', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const reason = (req.body?.reason || req.body?.rejectionReason || '').toString().trim();
+
+    const deposit = await prisma.deposit.findUnique({ where: { id } });
+    if (!deposit) return res.status(404).json({ ok: false, error: 'Deposit not found' });
+    if (deposit.status !== 'pending') return res.status(400).json({ ok: false, error: 'Deposit not pending' });
+
+    await prisma.deposit.update({
+      where: { id },
+      data: {
+        status: 'rejected',
+        rejectionReason: reason || 'Rejected',
+        rejectedAt: new Date(),
+      },
+    });
+
+    res.json({ ok: true, message: 'Deposit rejected successfully.' });
+  } catch (err) {
+    console.error('POST /admin/deposits/:id/reject failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to reject deposit' });
   }
 });
 
