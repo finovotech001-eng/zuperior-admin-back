@@ -1216,7 +1216,7 @@ app.get('/admin/withdrawals', authenticateAdmin, async (req, res) => {
       ...(country ? { User: { country } } : {}),
     };
 
-    const [total, items] = await Promise.all([
+    const [total, itemsRaw] = await Promise.all([
       prisma.withdrawal.count({ where }),
       prisma.withdrawal.findMany({
         where,
@@ -1229,6 +1229,50 @@ app.get('/admin/withdrawals', authenticateAdmin, async (req, res) => {
         },
       }),
     ]);
+
+    // Enrich withdrawals with user's approved payment method details (bank fields)
+    let items = itemsRaw;
+    try {
+      const userIds = Array.from(new Set(itemsRaw.map(w => w.userId).filter(Boolean)));
+      if (userIds.length) {
+        const { rows } = await pool.query(
+          `SELECT "id","userId","methodType","bankName","accountName","accountNumber","ifscSwiftCode","accountType",
+                  "currency","network","address","status",
+                  COALESCE("approvedAt","updatedAt","submittedAt","createdAt") AS ts
+           FROM public."PaymentMethod"
+           WHERE "userId" = ANY($1)
+           ORDER BY CASE WHEN status = 'approved' THEN 1 WHEN status = 'pending' THEN 2 ELSE 3 END ASC, ts DESC`,
+          [userIds]
+        );
+        const map = new Map();
+        for (const r of rows) {
+          // First row per user is the latest due to ORDER BY
+          if (!map.has(r.userId)) map.set(r.userId, r);
+        }
+
+        items = itemsRaw.map(w => {
+          const pm = map.get(w.userId);
+          if (pm) {
+            return {
+              ...w,
+              bankName: pm.bankName || null,
+              accountName: pm.accountName || null,
+              accountNumber: pm.accountNumber || null,
+              ifscSwiftCode: pm.ifscSwiftCode || null,
+              accountType: pm.accountType || null,
+              pmAddress: pm.address || null,
+              pmCurrency: pm.currency || null,
+              pmNetwork: pm.network || null,
+              pmMethodType: pm.methodType || null,
+              pmStatus: pm.status || null,
+            };
+          }
+          return w;
+        });
+      }
+    } catch (e) {
+      // If enrichment fails, continue with base items
+    }
 
     res.json({ ok: true, total, page, limit: take, items });
   } catch (err) {
