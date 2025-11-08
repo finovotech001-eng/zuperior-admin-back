@@ -214,9 +214,9 @@ model UserRole {
 }
 
 model Withdrawal {
-  id                    String        @id
+  id                    String        @id @default(uuid())
   userId                String
-  mt5AccountId          String
+  mt5AccountId          String?
   amount                Float
   method                String
   bankDetails           String?
@@ -227,20 +227,22 @@ model Withdrawal {
   approvedAt            DateTime?
   rejectedAt            DateTime?
   createdAt             DateTime      @default(now())
-  updatedAt             DateTime
+  updatedAt             DateTime      @updatedAt
   currency              String        @default("USD")
   externalTransactionId String?
   paymentMethod         String?
   processedAt           DateTime?
   walletAddress         String?
-  Transaction           Transaction[]
-  User                  User          @relation(fields: [userId], references: [id])
-  MT5Account            MT5Account    @relation(fields: [mt5AccountId], references: [id])
+  transactions          Transaction[] @relation("transactions")
+  mt5Account            MT5Account?   @relation("withdrawals", fields: [mt5AccountId], references: [id])
+  user                  User          @relation("withdrawals", fields: [userId], references: [id])
+  walletId              String?
+  wallet                Wallet?       @relation(fields: [walletId], references: [id])
 
-  @@index([createdAt])
+  @@index([userId])
   @@index([mt5AccountId])
   @@index([status])
-  @@index([userId])
+  @@index([createdAt])
 }
 
 model chat_conversations {
