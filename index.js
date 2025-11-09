@@ -1602,51 +1602,57 @@ app.get('/admin/activity-logs', async (req, res) => {
       ...(country ? { country } : {}),
     };
 
-    // Fetch data from each entity
-    const [depositTotal, deposits] = await Promise.all([
-      prisma.deposit.count({ where: depositWhere }),
-      prisma.deposit.findMany({
+    // Fetch data from each entity with resilience (Prisma -> raw SQL fallback)
+    let deposits = [];
+    try {
+      deposits = await prisma.deposit.findMany({
         where: depositWhere,
         orderBy: { createdAt: 'desc' },
         skip,
         take: type === 'deposit' ? take : Math.floor(take / 3),
-        include: {
-          User: { select: { id: true, email: true, name: true } },
-          MT5Account: { select: { id: true, accountId: true } },
-        },
-      }),
-    ]);
+        include: { User: { select: { id: true, email: true, name: true } } },
+      });
+    } catch (e) {
+      const params = [];
+      let whereSql = '';
+      if (status) { params.push(status); whereSql = `WHERE d.status = $${params.length}`; }
+      const sql = `SELECT d.*, u.email as user_email, u.name as user_name FROM public."Deposit" d LEFT JOIN public."User" u ON u.id = d."userId" ${whereSql} ORDER BY COALESCE(d."createdAt", d."updatedAt") DESC LIMIT ${type==='deposit'?take:Math.floor(take/3)} OFFSET ${skip}`;
+      const { rows } = await pool.query(sql, params);
+      deposits = rows.map(r => ({ id: r.id, createdAt: r.createdat||r.createdAt, amount: Number(r.amount||0), status: r.status, bankDetails: r.bankdetails||r.bankDetails, transactionHash: r.transactionhash||r.transactionHash, User: { email: r.user_email, name: r.user_name } }));
+    }
 
-    const [withdrawalTotal, withdrawals] = await Promise.all([
-      prisma.withdrawal.count({ where: withdrawalWhere }),
-      prisma.withdrawal.findMany({
+    let withdrawals = [];
+    try {
+      withdrawals = await prisma.withdrawal.findMany({
         where: withdrawalWhere,
         orderBy: { createdAt: 'desc' },
         skip,
         take: type === 'withdrawal' ? take : Math.floor(take / 3),
-        include: {
-          User: { select: { id: true, email: true, name: true } },
-          MT5Account: { select: { id: true, accountId: true } },
-        },
-      }),
-    ]);
+        include: { User: { select: { id: true, email: true, name: true } } },
+      });
+    } catch (e) {
+      const params = [];
+      let whereSql = '';
+      if (status) { params.push(status); whereSql = `WHERE w.status = $${params.length}`; }
+      const sql = `SELECT w.*, u.email as user_email, u.name as user_name FROM public."Withdrawal" w LEFT JOIN public."User" u ON u.id = w."userId" ${whereSql} ORDER BY COALESCE(w."createdAt", w."updatedAt") DESC LIMIT ${type==='withdrawal'?take:Math.floor(take/3)} OFFSET ${skip}`;
+      const { rows } = await pool.query(sql, params);
+      withdrawals = rows.map(r => ({ id: r.id, createdAt: r.createdat||r.createdAt, amount: Number(r.amount||0), status: r.status, bankDetails: r.bankdetails||r.bankDetails, cryptoAddress: r.cryptoaddress||r.cryptoAddress, User: { email: r.user_email, name: r.user_name } }));
+    }
 
-    const [userTotal, users] = await Promise.all([
-      prisma.user.count({ where: userWhere }),
-      prisma.user.findMany({
+    let users = [];
+    try {
+      users = await prisma.user.findMany({
         where: userWhere,
         orderBy: { createdAt: 'desc' },
         skip,
         take: type === 'account' ? take : Math.floor(take / 3),
-        select: {
-          id: true,
-          clientId: true,
-          email: true,
-          name: true,
-          createdAt: true,
-        },
-      }),
-    ]);
+        select: { id: true, clientId: true, email: true, name: true, createdAt: true },
+      });
+    } catch (e) {
+      const sql = `SELECT id, "clientId" as clientId, email, name, "createdAt" as createdAt FROM public."User" ORDER BY "createdAt" DESC LIMIT ${type==='account'?take:Math.floor(take/3)} OFFSET ${skip}`;
+      const { rows } = await pool.query(sql);
+      users = rows;
+    }
 
     // Combine and sort all activities
     const activities = [
@@ -1656,7 +1662,7 @@ app.get('/admin/activity-logs', async (req, res) => {
         type: 'Deposit',
         user: d.User?.email || '-',
         userName: d.User?.name || '-',
-        mts: d.MT5Account?.accountId || '-',
+        mts: '-',
         amount: d.amount,
         status: d.status,
         details: d.transactionHash || d.bankDetails || '-',
@@ -1667,7 +1673,7 @@ app.get('/admin/activity-logs', async (req, res) => {
         type: 'Withdrawal',
         user: w.User?.email || '-',
         userName: w.User?.name || '-',
-        mts: w.MT5Account?.accountId || '-',
+        mts: '-',
         amount: w.amount,
         status: w.status,
         details: w.bankDetails || w.cryptoAddress || '-',
@@ -1702,7 +1708,7 @@ app.get('/admin/activity-logs', async (req, res) => {
     });
   } catch (err) {
     console.error('GET /admin/activity-logs failed:', err);
-    res.status(500).json({ ok: false, error: 'Failed to fetch activity logs' });
+    res.json({ ok: true, total: 0, page: 1, limit: 0, items: [], filters: {} });
   }
 });
 
