@@ -1216,52 +1216,37 @@ app.get('/admin/withdrawals', authenticateAdmin, async (req, res) => {
       ...(country ? { User: { country } } : {}),
     };
 
+    // Always use raw SQL here to avoid Prisma schema drift errors (e.g., mt5AccountId column)
     let total = 0; let itemsRaw = [];
-    try {
-      const [t, list] = await Promise.all([
-        prisma.withdrawal.count({ where }),
-        prisma.withdrawal.findMany({
-          where,
-          orderBy: { createdAt: 'desc' },
-          skip,
-          take,
-          include: { User: { select: { id: true, email: true, name: true } } },
-        }),
-      ]);
-      total = t; itemsRaw = list;
-    } catch (e) {
-      console.warn('Prisma withdraw list failed, falling back to SQL:', e.message);
-      // Fallback to raw SQL to be robust against schema drift
-      const params = [];
-      let whereSql = '';
-      if (status) { params.push(status); whereSql += `WHERE w.status = $${params.length}`; }
-      const sql = `
-        SELECT w.*, u.email as user_email, u.name as user_name
-        FROM public."Withdrawal" w
-        LEFT JOIN public."User" u ON u.id = w."userId"
-        ${whereSql}
-        ORDER BY COALESCE(w."createdAt", w."updatedAt") DESC
-        LIMIT ${take}
-        OFFSET ${skip}
-      `;
-      const { rows } = await pool.query(sql, params);
-      total = rows.length;
-      itemsRaw = rows.map(r => ({
-        id: r.id,
-        userId: r.userid || r.userId,
-        amount: Number(r.amount || 0),
-        currency: r.currency || 'USD',
-        method: r.method || null,
-        bankDetails: r.bankdetails || r.bankDetails || null,
-        cryptoAddress: r.cryptoaddress || r.cryptoAddress || null,
-        walletAddress: r.walletaddress || r.walletAddress || null,
-        paymentMethod: r.paymentmethod || r.paymentMethod || null,
-        status: r.status || null,
-        createdAt: r.createdat || r.createdAt || null,
-        updatedAt: r.updatedat || r.updatedAt || null,
-        User: { id: r.userid || r.userId, email: r.user_email || null, name: r.user_name || null },
-      }));
-    }
+    const params = [];
+    let whereSql = '';
+    if (status) { params.push(status); whereSql += `WHERE w.status = $${params.length}`; }
+    const sql = `
+      SELECT w.*, u.email as user_email, u.name as user_name
+      FROM public."Withdrawal" w
+      LEFT JOIN public."User" u ON u.id = w."userId"
+      ${whereSql}
+      ORDER BY COALESCE(w."createdAt", w."updatedAt") DESC
+      LIMIT ${take}
+      OFFSET ${skip}
+    `;
+    const { rows } = await pool.query(sql, params);
+    total = rows.length;
+    itemsRaw = rows.map(r => ({
+      id: r.id,
+      userId: r.userid || r.userId,
+      amount: Number(r.amount || 0),
+      currency: r.currency || 'USD',
+      method: r.method || null,
+      bankDetails: r.bankdetails || r.bankDetails || null,
+      cryptoAddress: r.cryptoaddress || r.cryptoAddress || null,
+      walletAddress: r.walletaddress || r.walletAddress || null,
+      paymentMethod: r.paymentmethod || r.paymentMethod || null,
+      status: r.status || null,
+      createdAt: r.createdat || r.createdAt || null,
+      updatedAt: r.updatedat || r.updatedAt || null,
+      User: { id: r.userid || r.userId, email: r.user_email || null, name: r.user_name || null },
+    }));
 
     // Enrich withdrawals with user's approved payment method details (bank fields)
     let items = itemsRaw;
@@ -1315,35 +1300,166 @@ app.get('/admin/withdrawals', authenticateAdmin, async (req, res) => {
   }
 });
 
-// Approve withdrawal (wallet-only; raw SQL for schema resilience)
+// Approve withdrawal and deduct from user's wallet balance
 app.post('/admin/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
   const client = await pool.connect();
   try {
     const { id } = req.params;
     const externalId = (req.body?.externalTransactionId || req.body?.transactionId || req.body?.tx || req.body?.hash || '').toString().trim();
 
-    const sel = await client.query('SELECT * FROM public."Withdrawal" WHERE id = $1', [id]);
-    if (!sel.rows || sel.rows.length === 0) return res.status(404).json({ ok: false, error: 'Withdrawal not found' });
-    const w = sel.rows[0];
-    if (String(w.status || '').toLowerCase() !== 'pending') return res.status(400).json({ ok: false, error: 'Withdrawal not pending' });
+    await client.query('BEGIN');
 
-    // Try to set externalTransactionId if the column exists; fall back otherwise
-    let updated = false;
+    // Lock the withdrawal row to avoid race conditions during approval
+    const sel = await client.query('SELECT * FROM public."Withdrawal" WHERE id = $1 FOR UPDATE', [id]);
+    if (!sel.rows || sel.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: 'Withdrawal not found' });
+    }
+    const w = sel.rows[0];
+
+    if (String(w.status || '').toLowerCase() !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: 'Withdrawal not pending' });
+    }
+
+    const amount = Number(w.amount || 0);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: 'Invalid withdrawal amount' });
+    }
+
+    // Detect actual wallet table name (wallet vs Wallet) in this DB
+    const wtRes = await client.query(
+      `SELECT table_name FROM information_schema.tables 
+       WHERE table_schema = 'public' AND lower(table_name) = 'wallet' LIMIT 1`
+    );
+    const walletTable = (wtRes.rows && wtRes.rows[0] && wtRes.rows[0].table_name) ? wtRes.rows[0].table_name : 'wallet';
+    // Detect user id column on the wallet table (userid vs userId vs user_id)
+    const colRes = await client.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = $1`,
+      [walletTable]
+    );
+    let userIdCol = 'userid';
+    for (const r of colRes.rows || []) {
+      if (r.column_name === 'userid' || r.column_name === 'userId' || r.column_name === 'user_id') { userIdCol = r.column_name; break; }
+    }
+
+    const userId = w.userId || w.userid;
+    // Ensure a wallet exists for this user
+    let walletId;
+    let beforeBalance = 0;
+    const cw = await client.query(`SELECT id, balance FROM public."${walletTable}" WHERE "${userIdCol}" = $1 ORDER BY "createdAt" ASC LIMIT 1`, [userId]);
+    if (cw.rows && cw.rows.length) {
+      walletId = cw.rows[0].id;
+      beforeBalance = Number(cw.rows[0].balance || 0);
+    } else {
+      walletId = crypto.randomUUID();
+      const walletNumber = 'ZUP' + Math.floor(100000 + Math.random() * 900000);
+      await client.query(`INSERT INTO public."${walletTable}" (id, "${userIdCol}", balance, currency, "createdAt", "updatedAt", "walletNumber") VALUES ($1,$2,$3,$4,NOW(),NOW(),$5)`, [walletId, userId, 0, (w.currency || 'USD'), walletNumber]);
+    }
+
+    const newBalance = beforeBalance - amount;
+    await client.query(`UPDATE public."${walletTable}" SET balance = $2, "updatedAt" = NOW() WHERE id = $1`, [walletId, newBalance]);
+
+    // Update withdrawal status to approved and set metadata
     try {
       const sql = 'UPDATE public."Withdrawal" SET status = $2, "approvedAt" = NOW(), "approvedBy" = $3, "externalTransactionId" = $4 WHERE id = $1';
       await client.query(sql, [id, 'approved', String(req.adminId || ''), externalId || null]);
-      updated = true;
     } catch (e) {
-      // Column may not exist in some envs; do minimal update
-      const sql = 'UPDATE public."Withdrawal" SET status = $2, "approvedAt" = NOW(), "approvedBy" = $3 WHERE id = $1';
-      await client.query(sql, [id, 'approved', String(req.adminId || '')]);
-      updated = true;
+      // Column may not exist; minimal update
+      await client.query('UPDATE public."Withdrawal" SET status = $2, "approvedAt" = NOW(), "approvedBy" = $3 WHERE id = $1', [id, 'approved', String(req.adminId || '')]);
     }
 
-    if (!updated) throw new Error('Failed to update withdrawal');
-    return res.json({ ok: true, message: 'Withdrawal approved (wallet flow). No MT5 deduction performed.' });
+    await client.query('COMMIT');
+    return res.json({ ok: true, message: 'Withdrawal approved and wallet balance deducted', walletId, previousBalance: beforeBalance, newBalance });
   } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
     console.error('POST /admin/withdrawals/:id/approve failed:', err?.message || err);
+    res.status(500).json({ ok: false, error: 'Failed to approve withdrawal' });
+  } finally {
+    client.release();
+  }
+});
+
+// GET variant for environments that accidentally issue GET requests
+// Approves and deducts just like the POST endpoint above.
+app.get('/admin/withdrawals/:id/approve', authenticateAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const { id } = req.params;
+    const externalId = (req.query?.externalTransactionId || req.query?.transactionId || req.query?.tx || req.query?.hash || '').toString().trim();
+
+    await client.query('BEGIN');
+    const sel = await client.query('SELECT * FROM public."Withdrawal" WHERE id = $1 FOR UPDATE', [id]);
+    if (!sel.rows || sel.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ ok: false, error: 'Withdrawal not found' });
+    }
+    const w = sel.rows[0];
+    if (String(w.status || '').toLowerCase() !== 'pending') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: 'Withdrawal not pending' });
+    }
+
+    const amount = Number(w.amount || 0);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ ok: false, error: 'Invalid withdrawal amount' });
+    }
+
+    // Determine user's wallet strictly by userId; handle both wallet/Wallet table names
+    async function selectUserWallet(userId) {
+      try {
+        const r = await client.query('SELECT id, balance FROM public."wallet" WHERE userid = $1 ORDER BY "createdAt" ASC LIMIT 1', [userId]);
+        return { table: 'wallet', rows: r.rows };
+      } catch (_) {
+        const r2 = await client.query('SELECT id, balance FROM public."Wallet" WHERE userid = $1 ORDER BY "createdAt" ASC LIMIT 1', [userId]);
+        return { table: 'Wallet', rows: r2.rows };
+      }
+    }
+    async function lockWalletById(table, id) {
+      return client.query(`SELECT id, balance FROM public."${table}" WHERE id = $1 FOR UPDATE`, [id]);
+    }
+    async function insertWalletIfMissing(userId, currency) {
+      const walletNumber = 'ZUP' + Math.floor(100000 + Math.random() * 900000);
+      const newId = crypto.randomUUID();
+      try {
+        const r = await client.query('INSERT INTO public."wallet" (id, userid, balance, currency, "createdAt", "updatedAt", "walletNumber") VALUES ($1,$2,$3,$4,NOW(),NOW(),$5) RETURNING id, balance', [newId, userId, 0, currency, walletNumber]);
+        return { table: 'wallet', rows: r.rows };
+      } catch (_) {
+        const r2 = await client.query('INSERT INTO public."Wallet" (id, userid, balance, currency, "createdAt", "updatedAt", "walletNumber") VALUES ($1,$2,$3,$4,NOW(),NOW(),$5) RETURNING id, balance', [newId, userId, 0, currency, walletNumber]);
+        return { table: 'Wallet', rows: r2.rows };
+      }
+    }
+
+    const userId = w.userId || w.userid;
+    // Ensure a wallet exists for this user
+    let walletId;
+    let beforeBalance = 0;
+    const cw = await client.query(`SELECT id, balance FROM public."${walletTable}" WHERE "${userIdCol}" = $1 ORDER BY "createdAt" ASC LIMIT 1`, [userId]);
+    if (cw.rows && cw.rows.length) {
+      walletId = cw.rows[0].id;
+      beforeBalance = Number(cw.rows[0].balance || 0);
+    } else {
+      walletId = crypto.randomUUID();
+      const walletNumber = 'ZUP' + Math.floor(100000 + Math.random() * 900000);
+      await client.query(`INSERT INTO public."${walletTable}" (id, "${userIdCol}", balance, currency, "createdAt", "updatedAt", "walletNumber") VALUES ($1,$2,$3,$4,NOW(),NOW(),$5)`, [walletId, userId, 0, (w.currency || 'USD'), walletNumber]);
+    }
+    const newBalance = beforeBalance - amount;
+    await client.query(`UPDATE public."${walletTable}" SET balance = $2, "updatedAt" = NOW() WHERE id = $1`, [walletId, newBalance]);
+
+    try {
+      const sql = 'UPDATE public."Withdrawal" SET status = $2, "approvedAt" = NOW(), "approvedBy" = $3, "externalTransactionId" = $4 WHERE id = $1';
+      await client.query(sql, [id, 'approved', String(req.adminId || ''), externalId || null]);
+    } catch (e) {
+      await client.query('UPDATE public."Withdrawal" SET status = $2, "approvedAt" = NOW(), "approvedBy" = $3 WHERE id = $1', [id, 'approved', String(req.adminId || '')]);
+    }
+
+    await client.query('COMMIT');
+    return res.json({ ok: true, message: 'Withdrawal approved and wallet balance deducted', walletId, previousBalance: beforeBalance, newBalance });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error('GET /admin/withdrawals/:id/approve failed:', err?.message || err);
     res.status(500).json({ ok: false, error: 'Failed to approve withdrawal' });
   } finally {
     client.release();
