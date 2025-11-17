@@ -89,7 +89,7 @@ model MT5Account {
   updatedAt      DateTime
   User           User?            @relation(fields: [userId], references: [id])
   Deposit        Deposit[]
-  Withdrawal     Withdrawal[]
+  Withdrawal     Withdrawal[]     @relation("withdrawals")
   MT5Transaction MT5Transaction[]
 }
 
@@ -174,7 +174,7 @@ model Transaction {
   createdAt     DateTime    @default(now())
   Deposit       Deposit?    @relation(fields: [depositId], references: [id])
   User          User        @relation(fields: [userId], references: [id])
-  Withdrawal    Withdrawal? @relation(fields: [withdrawalId], references: [id])
+  Withdrawal    Withdrawal? @relation("transactions", fields: [withdrawalId], references: [id])
 
   @@index([depositId])
   @@index([status])
@@ -202,7 +202,7 @@ model User {
   KYC           KYC?
   MT5Account    MT5Account[]
   Transaction   Transaction[]
-  Withdrawal    Withdrawal[]
+  Withdrawal    Withdrawal[] @relation("withdrawals")
 }
 
 model UserRole {
@@ -237,7 +237,6 @@ model Withdrawal {
   mt5Account            MT5Account?   @relation("withdrawals", fields: [mt5AccountId], references: [id])
   user                  User          @relation("withdrawals", fields: [userId], references: [id])
   walletId              String?
-  wallet                Wallet?       @relation(fields: [walletId], references: [id])
 
   @@index([userId])
   @@index([mt5AccountId])
@@ -427,6 +426,55 @@ model mt5_groups {
   synced_at   DateTime? @default(now()) @db.Timestamptz(6)
   created_at  DateTime? @default(now()) @db.Timestamptz(6)
   updated_at  DateTime? @default(now()) @db.Timestamptz(6)
+}
+
+model group_management {
+  id                    Int       @id @default(autoincrement())
+  group                 String    @unique @db.VarChar(255)
+  dedicated_name        String?   @db.VarChar(255)
+  server                Int?      @default(1)
+  permissions_flags     Int?      @default(0)
+  auth_mode             Int?      @default(0)
+  auth_password_min     Int?      @default(8)
+  company               String?   @db.VarChar(255)
+  company_page          String?   @db.VarChar(255)
+  company_email         String?   @db.VarChar(255)
+  company_support_page  String?   @db.VarChar(500)
+  company_support_email String?   @db.VarChar(255)
+  company_catalog       String?   @db.VarChar(255)
+  currency              String?   @db.VarChar(10)
+  currency_digits       Int?      @default(2)
+  reports_mode          Int?      @default(1)
+  reports_flags         Int?      @default(5)
+  reports_smtp          String?   @db.VarChar(255)
+  reports_smtp_login    String?   @db.VarChar(255)
+  news_mode             Int?      @default(2)
+  news_category         String?   @db.VarChar(255)
+  mail_mode             Int?      @default(1)
+  trade_flags           Int?      @default(2135)
+  trade_interestrate    Decimal?  @default(0) @db.Decimal(10, 2)
+  trade_virtual_credit  Decimal?  @default(0) @db.Decimal(10, 2)
+  margin_free_mode      Int?      @default(1)
+  margin_so_mode        Int?      @default(0)
+  margin_call           Decimal?  @default(100) @db.Decimal(10, 2)
+  margin_stop_out       Decimal?  @default(5) @db.Decimal(10, 2)
+  demo_leverage         Int?      @default(100)
+  demo_deposit          Decimal?  @default(0) @db.Decimal(10, 2)
+  limit_history         Int?      @default(0)
+  limit_orders          Int?      @default(0)
+  limit_symbols         Int?      @default(0)
+  limit_positions       Int?      @default(0)
+  margin_mode           Int?      @default(2)
+  margin_flags          Int?      @default(0)
+  trade_transfer_mode   Int?      @default(0)
+  is_active             Boolean   @default(true)
+  synced_at             DateTime? @default(now()) @db.Timestamptz(6)
+  created_at            DateTime? @default(now()) @db.Timestamptz(6)
+  updated_at            DateTime? @default(now()) @db.Timestamptz(6)
+  
+  @@index([group])
+  @@index([is_active])
+  @@index([server])
 }
 
 model symbols {
