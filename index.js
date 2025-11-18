@@ -2237,47 +2237,165 @@ app.get('/admin/users/filtered', async (req, res) => {
   }
 });
 
-// Send emails to users
-app.post('/admin/send-emails', async (req, res) => {
-  try {
-    const { recipients, subject, body, isHtml = true, imageUrl } = req.body || {};
+// Helper function to build user filter based on recipient type
+async function buildUserFilter(recipientType, specificUsers = []) {
+  const userWhere = {};
 
-    if (!recipients || !subject || !body) {
-      return res.status(400).json({ ok: false, error: 'Recipients, subject, and body are required' });
+  switch (recipientType) {
+    case 'all':
+      // All users - no filter
+      break;
+    
+    case 'verified':
+      userWhere.emailVerified = true;
+      break;
+    
+    case 'unverified':
+      userWhere.emailVerified = false;
+      break;
+    
+    case 'active':
+      userWhere.status = 'active';
+      break;
+    
+    case 'banned':
+      userWhere.status = 'banned';
+      break;
+    
+    case 'inactive':
+      userWhere.status = { not: 'active' };
+      break;
+    
+    case 'kyc_verified':
+      userWhere.KYC = {
+        OR: [
+          { verificationStatus: 'Approved' },
+          { verificationStatus: 'Verified' },
+          { isDocumentVerified: true }
+        ]
+      };
+      break;
+    
+    case 'kyc_unverified':
+      userWhere.OR = [
+        { KYC: null },
+        { 
+          KYC: {
+            AND: [
+              { verificationStatus: { notIn: ['Approved', 'Verified'] } },
+              { isDocumentVerified: false }
+            ]
+          }
+        }
+      ];
+      break;
+    
+    case 'specific':
+      if (Array.isArray(specificUsers) && specificUsers.length > 0) {
+        // Check if it's IDs or emails
+        const isEmail = specificUsers[0].includes('@');
+        if (isEmail) {
+          userWhere.email = { in: specificUsers };
+        } else {
+          userWhere.id = { in: specificUsers };
+        }
+      } else {
+        // Return empty result if no specific users
+        return { id: { in: [] } };
+      }
+      break;
+    
+    default:
+      throw new Error(`Invalid recipient type: ${recipientType}`);
+  }
+
+  return userWhere;
+}
+
+// Search users for email sending (autocomplete)
+app.get('/admin/send-emails/search-users', authenticateAdmin, async (req, res) => {
+  try {
+    const { q = '', limit = 20 } = req.query;
+    
+    if (!q || q.length < 2) {
+      return res.json({ ok: true, users: [] });
+    }
+
+    const users = await prisma.user.findMany({
+      where: {
+        OR: [
+          { email: { contains: q, mode: 'insensitive' } },
+          { name: { contains: q, mode: 'insensitive' } },
+        ],
+      },
+      take: parseInt(limit),
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        emailVerified: true,
+        status: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    res.json({ ok: true, users });
+  } catch (err) {
+    console.error('GET /admin/send-emails/search-users failed:', err);
+    res.status(500).json({ ok: false, error: 'Failed to search users' });
+  }
+});
+
+// Preview endpoint - get recipient count without sending
+app.post('/admin/send-emails/preview', authenticateAdmin, async (req, res) => {
+  try {
+    const { recipientType, specificUsers = [] } = req.body || {};
+
+    if (!recipientType) {
+      return res.status(400).json({ ok: false, error: 'Recipient type is required' });
+    }
+
+    const userWhere = await buildUserFilter(recipientType, specificUsers);
+
+    // Get count and sample users
+    const [count, sampleUsers] = await Promise.all([
+      prisma.user.count({ where: userWhere }),
+      prisma.user.findMany({
+        where: userWhere,
+        take: 10,
+        select: {
+          id: true,
+          email: true,
+          name: true,
+          emailVerified: true,
+          status: true,
+        },
+        orderBy: { createdAt: 'desc' }
+      })
+    ]);
+
+    res.json({
+      ok: true,
+      count,
+      sampleUsers,
+    });
+  } catch (err) {
+    console.error('POST /admin/send-emails/preview failed:', err);
+    res.status(500).json({ ok: false, error: err.message || 'Failed to preview recipients' });
+  }
+});
+
+// Send emails to users
+app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
+  try {
+    const { recipientType, specificUsers = [], subject, body, isHtml = true, imageUrl } = req.body || {};
+
+    if (!recipientType || !subject || !body) {
+      return res.status(400).json({ ok: false, error: 'Recipient type, subject, and body are required' });
     }
 
     // Build user filter criteria
-    const userWhere = {};
-
-    if (recipients === 'all') {
-      // Apply filters if provided
-      const { balanceMin, balanceMax, emailVerified, status, search } = req.body.filters || {};
-
-      // Always include MT5Account filter if balance filters are specified
-      if (balanceMin || balanceMax) {
-        userWhere.MT5Account = { some: {} };
-      }
-
-      if (emailVerified !== undefined) {
-        userWhere.emailVerified = emailVerified;
-      }
-
-      if (status) {
-        userWhere.status = status;
-      }
-
-      if (search) {
-        userWhere.OR = [
-          { email: { contains: search, mode: 'insensitive' } },
-          { name: { contains: search, mode: 'insensitive' } },
-        ];
-      }
-    } else if (Array.isArray(recipients)) {
-      // Specific user IDs
-      userWhere.id = { in: recipients };
-    } else {
-      return res.status(400).json({ ok: false, error: 'Invalid recipients format' });
-    }
+    const userWhere = await buildUserFilter(recipientType, specificUsers);
 
     // Fetch users
     const dbUsers = await prisma.user.findMany({
@@ -2286,88 +2404,109 @@ app.post('/admin/send-emails', async (req, res) => {
         id: true,
         email: true,
         name: true,
-        MT5Account: {
-          select: {
-            accountId: true,
-          },
-        },
+        emailVerified: true,
+        status: true,
       },
     });
 
-    // Filter by balance if specified and get actual balances
-    let users = [];
-    if (dbUsers.length > 0) {
-      const { balanceMin, balanceMax } = req.body.filters || {};
-
-      for (const user of dbUsers) {
-        let totalBalance = 0;
-
-        if (user.MT5Account && user.MT5Account.length > 0) {
-          // Get actual balance from MT5 API
-          const balancePromises = user.MT5Account.map(async (account) => {
-            try {
-              const response = await axios.get(`${process.env.MT5_API_BASE_URL}/api/Users/${account.accountId}/getClientProfile`, {
-                timeout: 5000,
-              });
-              return response.data?.Data?.Balance || 0;
-            } catch (error) {
-              console.warn(`Failed to fetch balance for account ${account.accountId}:`, error.message);
-              return 0;
-            }
-          });
-
-          const balances = await Promise.all(balancePromises);
-          totalBalance = balances.reduce((sum, balance) => sum + balance, 0);
-        }
-
-        // Apply balance filters
-        if ((balanceMin && totalBalance < parseFloat(balanceMin)) ||
-            (balanceMax && totalBalance > parseFloat(balanceMax))) {
-          continue; // Skip this user
-        }
-
-        users.push({
-          ...user,
-          totalBalance,
-        });
-      }
-    }
-
-    if (users.length === 0) {
+    if (dbUsers.length === 0) {
       return res.status(404).json({ ok: false, error: 'No users found matching criteria' });
     }
 
-    // Prepare email content
-    let htmlBody = body;
+    const users = dbUsers;
+
+    // Check if SMTP is configured
+    if (!emailTransporter || !process.env.SMTP_HOST) {
+      return res.status(500).json({ ok: false, error: 'Email service not configured. Please configure SMTP settings.' });
+    }
+
+    // Prepare email content with professional template
+    const emailTemplate = (content, imageUrl, emailSubject) => {
+      const companyName = process.env.FROM_NAME || 'Zuperior';
+      const companyEmail = process.env.FROM_EMAIL || process.env.SMTP_USER || 'support@zuperior.com';
+      const safeSubject = String(emailSubject || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      
+      return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${safeSubject}</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
+  <table role="presentation" style="width: 100%; border-collapse: collapse; background-color: #f4f4f4;">
+    <tr>
+      <td style="padding: 20px 0;">
+        <table role="presentation" style="width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+          <!-- Header -->
+          <tr>
+            <td style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
+              <h1 style="margin: 0; color: #ffffff; font-size: 24px;">${companyName}</h1>
+            </td>
+          </tr>
+          <!-- Content -->
+          <tr>
+            <td style="padding: 30px; line-height: 1.6; color: #333;">
+              <div style="font-size: 14px;">
+                ${content}
+              </div>
+              ${imageUrl ? `<div style="margin-top: 20px;"><img src="${imageUrl}" alt="Email Image" style="max-width: 100%; height: auto; border-radius: 4px;" onerror="this.style.display='none';" /></div>` : ''}
+            </td>
+          </tr>
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: #f8f9fa; padding: 20px; text-align: center; border-radius: 0 0 8px 8px; border-top: 1px solid #e9ecef;">
+              <p style="margin: 0; color: #6c757d; font-size: 12px;">
+                © ${new Date().getFullYear()} ${companyName}. All rights reserved.<br>
+                <a href="mailto:${companyEmail}" style="color: #667eea; text-decoration: none;">${companyEmail}</a>
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+      `;
+    };
+
+    let htmlBody = emailTemplate(body, imageUrl, subject);
     let textBody = body.replace(/<[^>]*>/g, ''); // Strip HTML for text version
 
-    // Add image if provided
-    if (imageUrl) {
-      if (isHtml) {
-        htmlBody += `<br><br><img src="${imageUrl}" alt="Email Image" style="max-width: 100%; height: auto;" />`;
+    // Send emails with error handling
+    const results = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    for (const user of users) {
+      try {
+        const mailOptions = {
+          from: `"${process.env.FROM_NAME || 'Zuperior'}" <${process.env.FROM_EMAIL || process.env.SMTP_USER}>`,
+          to: user.email,
+          subject: subject,
+          text: textBody,
+          ...(isHtml && { html: htmlBody }),
+        };
+
+        await emailTransporter.sendMail(mailOptions);
+        successCount++;
+        results.push({ email: user.email, status: 'success' });
+      } catch (error) {
+        failureCount++;
+        console.error(`Failed to send email to ${user.email}:`, error.message);
+        results.push({ email: user.email, status: 'failed', error: error.message });
       }
     }
 
-    // Send emails
-    const emailPromises = users.map(user => {
-      const mailOptions = {
-        from: `"${process.env.FROM_NAME}" <${process.env.FROM_EMAIL}>`,
-        to: user.email,
-        subject: subject,
-        text: textBody,
-        ...(isHtml && { html: htmlBody }),
-      };
-
-      return emailTransporter.sendMail(mailOptions);
-    });
-
-    await Promise.all(emailPromises);
-
     res.json({
       ok: true,
-      message: `Emails sent successfully to ${users.length} users`,
+      message: `Emails sent: ${successCount} successful, ${failureCount} failed`,
       recipientsCount: users.length,
-      users: users.map(u => ({ id: u.id, email: u.email, name: u.name, balance: u.totalBalance }))
+      successCount,
+      failureCount,
+      results: results.slice(0, 50), // Return first 50 results to avoid large response
     });
 
   } catch (err) {
