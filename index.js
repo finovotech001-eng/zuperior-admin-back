@@ -2537,8 +2537,15 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
     const { recipientType, specificUsers = [], subject, body, isHtml = true, imageUrl, attachments = [], templateId } = req.body || {};
     const adminId = req.admin?.id?.toString() || req.admin?.username || null;
 
-    if (!recipientType || !subject || !body) {
-      return res.status(400).json({ ok: false, error: 'Recipient type, subject, and body are required' });
+    if (!recipientType) {
+      return res.status(400).json({ ok: false, error: 'Recipient type is required' });
+    }
+
+    // If template is selected, subject and body are not required (template has its own)
+    if (!templateId) {
+      if (!subject || !body) {
+        return res.status(400).json({ ok: false, error: 'Subject and body are required when no template is selected' });
+      }
     }
 
     // Build user filter criteria
@@ -2572,6 +2579,26 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
       // Try to get default template
       selectedTemplate = await getDefaultEmailTemplate();
     }
+
+    // If template is selected, extract subject from template if not provided
+    let finalSubject = subject;
+    if (selectedTemplate && !finalSubject) {
+      const htmlCode = selectedTemplate.html_code || '';
+      // Try to extract subject from <title> tag
+      const titleMatch = htmlCode.match(/<title[^>]*>([^<]+)<\/title>/i);
+      if (titleMatch) {
+        finalSubject = titleMatch[1].trim();
+        // Remove variable syntax if present
+        finalSubject = finalSubject.replace(/\{\{subject\}\}/gi, '').trim();
+      }
+      // If still no subject, use template name
+      if (!finalSubject) {
+        finalSubject = selectedTemplate.name || 'Email';
+      }
+    }
+
+    // If template is selected, always use HTML format
+    const finalIsHtml = selectedTemplate ? true : isHtml;
 
     // Prepare email content with professional template
     const emailTemplate = (content, imageUrl, emailSubject, template = null, recipientName = null, recipientEmail = null) => {
@@ -2693,25 +2720,42 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
 
     // Function to get template HTML for a user
     const getTemplateHtml = (user) => {
-      // If a template is selected
+      // If a template is selected, use the template's HTML code directly
       if (selectedTemplate && selectedTemplate.html_code) {
-        let templateHtml = '';
+        // Check if body is already a full HTML document (from preview)
+        // If it contains DOCTYPE or <html> tag, it's already complete - use it directly
+        const bodyIsFullHtml = body && (
+          body.trim().toLowerCase().startsWith('<!doctype html') ||
+          body.trim().toLowerCase().startsWith('<html') ||
+          body.includes('<!DOCTYPE html') ||
+          body.includes('<html')
+        );
         
-        // Check if body contains the full template HTML (starts with <!DOCTYPE or <html)
-        // If so, the user has loaded the template into body field, so use it directly
-        const bodyIsFullTemplate = body.trim().startsWith('<!DOCTYPE') || body.trim().startsWith('<html');
-        
-        if (bodyIsFullTemplate) {
-          // Body contains the full template HTML, use it directly
-          templateHtml = body;
-        } else {
-          // Body contains just the content, use template's html_code and replace {{content}}
-          templateHtml = selectedTemplate.html_code;
+        if (bodyIsFullHtml) {
+          // Body is already the full rendered template, just replace user-specific variables
+          let finalHtml = body;
+          
+          // Only replace user-specific variables that might not have been replaced in preview
+          const userVariables = {
+            recipientName: user.name || '',
+            recipientEmail: user.email || '',
+          };
+          
+          Object.keys(userVariables).forEach((key) => {
+            const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'g');
+            finalHtml = finalHtml.replace(regex, userVariables[key]);
+          });
+          
+          return finalHtml;
         }
+        
+        // Otherwise, use the template's HTML code and replace all variables
+        let templateHtml = selectedTemplate.html_code;
         
         // Replace all variables in the template
         const variables = {
-          subject: subject,
+          content: body || '', // Use body if provided, otherwise empty
+          subject: finalSubject || selectedTemplate.name || 'Email',
           logoUrl: process.env.LOGO_URL || 'https://dashboard.zuperior.com/_next/image?url=%2Flogo.png&w=64&q=75',
           companyName: 'Zuperior FX Limited',
           companyEmail: process.env.FROM_EMAIL || process.env.SMTP_USER || 'info@zuperior.com',
@@ -2722,20 +2766,7 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
           recipientEmail: user.email || '',
         };
         
-        // If body is the full template, replace all variables
-        // For {{content}}, if it exists in the template, remove it (since body is already the full template)
-        if (bodyIsFullTemplate) {
-          Object.keys(variables).forEach((key) => {
-            const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'g');
-            templateHtml = templateHtml.replace(regex, variables[key]);
-          });
-          // Remove {{content}} if it still exists (body is already the full template)
-          templateHtml = templateHtml.replace(/\{\{content\}\}/gi, '');
-          return templateHtml;
-        }
-        
-        // Otherwise, body is just content, so replace {{content}} with body
-        variables.content = body;
+        // Replace all variables in the template
         Object.keys(variables).forEach((key) => {
           const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'g');
           templateHtml = templateHtml.replace(regex, variables[key]);
@@ -2745,7 +2776,7 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
       }
       
       // Otherwise, use the default template function which wraps body in template structure
-      return emailTemplate(body, imageUrl, subject, null, user.name, user.email);
+      return emailTemplate(body, imageUrl, finalSubject || subject, null, user.name, user.email);
     };
 
     // Send emails with error handling using external API
@@ -2758,15 +2789,20 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
       try {
         // Get template HTML for this user
         const userTemplateHtml = getTemplateHtml(user);
-        const userContentBody = isHtml ? userTemplateHtml : body;
+        const userContentBody = finalIsHtml ? userTemplateHtml : body;
+
+        // Ensure we have content
+        if (!userContentBody || !userContentBody.trim()) {
+          throw new Error('Email content is empty');
+        }
 
         // Create email record in database with pending status
         emailRecord = await createSentEmailRecord({
           recipient_email: user.email,
           recipient_name: user.name || null,
-          subject: subject,
+          subject: finalSubject || 'Email',
           content_body: userContentBody,
-          is_html: isHtml,
+          is_html: finalIsHtml,
           recipient_type: recipientType,
           status: 'pending',
           admin_id: adminId,
@@ -2787,9 +2823,9 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
         try {
           const requestPayload = {
             recipient_email: user.email,
-            subject: subject,
+            subject: finalSubject || 'Email',
             content_body: userContentBody,
-            is_html: isHtml,
+            is_html: finalIsHtml,
           };
           
           // Only include attachments if there are any
@@ -3008,9 +3044,9 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
             await createSentEmailRecord({
               recipient_email: user.email,
               recipient_name: user.name || null,
-        subject: subject,
-              content_body: isHtml ? failedUserContentBody : body,
-              is_html: isHtml,
+              subject: finalSubject || 'Email',
+              content_body: finalIsHtml ? failedUserContentBody : body,
+              is_html: finalIsHtml,
               recipient_type: recipientType,
               status: 'failed',
               error_message: errorMessage,
