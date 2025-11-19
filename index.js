@@ -2693,7 +2693,59 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
 
     // Function to get template HTML for a user
     const getTemplateHtml = (user) => {
-      return emailTemplate(body, imageUrl, subject, selectedTemplate, user.name, user.email);
+      // If a template is selected
+      if (selectedTemplate && selectedTemplate.html_code) {
+        let templateHtml = '';
+        
+        // Check if body contains the full template HTML (starts with <!DOCTYPE or <html)
+        // If so, the user has loaded the template into body field, so use it directly
+        const bodyIsFullTemplate = body.trim().startsWith('<!DOCTYPE') || body.trim().startsWith('<html');
+        
+        if (bodyIsFullTemplate) {
+          // Body contains the full template HTML, use it directly
+          templateHtml = body;
+        } else {
+          // Body contains just the content, use template's html_code and replace {{content}}
+          templateHtml = selectedTemplate.html_code;
+        }
+        
+        // Replace all variables in the template
+        const variables = {
+          subject: subject,
+          logoUrl: process.env.LOGO_URL || 'https://dashboard.zuperior.com/_next/image?url=%2Flogo.png&w=64&q=75',
+          companyName: 'Zuperior FX Limited',
+          companyEmail: process.env.FROM_EMAIL || process.env.SMTP_USER || 'info@zuperior.com',
+          companyPhone: process.env.COMPANY_PHONE || '+44 7868 811937',
+          imageUrl: imageUrl || '',
+          currentYear: new Date().getFullYear().toString(),
+          recipientName: user.name || '',
+          recipientEmail: user.email || '',
+        };
+        
+        // If body is the full template, replace all variables
+        // For {{content}}, if it exists in the template, remove it (since body is already the full template)
+        if (bodyIsFullTemplate) {
+          Object.keys(variables).forEach((key) => {
+            const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'g');
+            templateHtml = templateHtml.replace(regex, variables[key]);
+          });
+          // Remove {{content}} if it still exists (body is already the full template)
+          templateHtml = templateHtml.replace(/\{\{content\}\}/gi, '');
+          return templateHtml;
+        }
+        
+        // Otherwise, body is just content, so replace {{content}} with body
+        variables.content = body;
+        Object.keys(variables).forEach((key) => {
+          const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'g');
+          templateHtml = templateHtml.replace(regex, variables[key]);
+        });
+        
+        return templateHtml;
+      }
+      
+      // Otherwise, use the default template function which wraps body in template structure
+      return emailTemplate(body, imageUrl, subject, null, user.name, user.email);
     };
 
     // Send emails with error handling using external API
@@ -2956,7 +3008,7 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
             await createSentEmailRecord({
               recipient_email: user.email,
               recipient_name: user.name || null,
-              subject: subject,
+        subject: subject,
               content_body: isHtml ? failedUserContentBody : body,
               is_html: isHtml,
               recipient_type: recipientType,
