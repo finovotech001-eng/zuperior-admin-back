@@ -187,7 +187,7 @@ async function createEmailTemplateRecord(data) {
   const insertSql = `
     INSERT INTO "email_templates"
       ("name","description","html_code","variables","is_default",
-       "preview_image_url","created_at","updated_at","created_by")
+       "from_email","created_at","updated_at","created_by")
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
     RETURNING *
   `;
@@ -198,7 +198,7 @@ async function createEmailTemplateRecord(data) {
     data.html_code,
     data.variables ?? [],
     data.is_default ?? false,
-    data.preview_image_url ?? null,
+    data.from_email ?? null,
     data.created_at ?? new Date(),
     data.updated_at ?? new Date(),
     data.created_by ?? null,
@@ -2608,105 +2608,138 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
       const logoUrl = process.env.LOGO_URL || 'https://dashboard.zuperior.com/_next/image?url=%2Flogo.png&w=64&q=75';
       const safeSubject = String(emailSubject || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       const currentYear = new Date().getFullYear();
+      const recipientDisplayName = recipientName || 'Valued Customer';
       
-      return `
-<!DOCTYPE html>
+      // Email-compatible HTML - no modern CSS, only inline styles, table-based layout
+      return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
   <title>${safeSubject}</title>
+  <!--[if mso]>
+  <style type="text/css">
+    body, table, td {font-family: Arial, Helvetica, sans-serif !important;}
+  </style>
+  <![endif]-->
 </head>
-<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f5f7fa;">
-  <table role="presentation" style="width: 100%; border-collapse: collapse; background-color: #f5f7fa;">
+<body style="margin: 0; padding: 0; background-color: #f5f7fa; font-family: Arial, Helvetica, sans-serif; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #f5f7fa; margin: 0; padding: 0;">
     <tr>
-      <td style="padding: 40px 20px;">
-        <table role="presentation" style="width: 100%; max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); overflow: hidden;">
-          <!-- Logo Header -->
+      <td align="center" style="padding: 20px 10px;">
+        <table width="600" cellpadding="0" cellspacing="0" border="0" style="max-width: 600px; width: 100%; background-color: #ffffff; margin: 0 auto;">
+          <!-- Header with Logo -->
           <tr>
-            <td style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 30px; text-align: center;">
-              <table role="presentation" align="center" style="margin: 0 auto; border-collapse: collapse;">
+            <td bgcolor="#667eea" style="padding: 30px 20px; text-align: center; background-color: #667eea;">
+              <table width="100%" cellpadding="0" cellspacing="0" border="0">
                 <tr>
-                  <td style="padding-right: 12px; vertical-align: middle;">
-                    <img src="${logoUrl}" alt="Zuperior" style="width: 40px; height: 40px; display: block; margin: 0 auto; border-radius: 8px;" />
+                  <td align="center" style="padding-bottom: 10px;">
+                    <img src="${logoUrl}" alt="Zuperior" width="48" height="48" style="display: block; border: 0; outline: none; text-decoration: none; width: 48px; height: 48px;" />
                   </td>
-                  <td style="vertical-align: middle;">
-                    <span style="display: inline-block; color: #ffffff; font-size: 24px; font-weight: 700; letter-spacing: -0.5px;">
-                      Zuperior
-                    </span>
+                </tr>
+                <tr>
+                  <td align="center" style="padding-top: 10px;">
+                    <span style="color: #ffffff; font-size: 24px; font-weight: bold; font-family: Arial, Helvetica, sans-serif; text-decoration: none;">Zuperior</span>
                   </td>
                 </tr>
               </table>
             </td>
           </tr>
           
-          <!-- Content -->
+          <!-- Main Content -->
           <tr>
-            <td style="padding: 40px 30px; line-height: 1.8; color: #2d3748;">
-              <div style="font-size: 16px; color: #2d3748;">
-                ${content}
-              </div>
-              ${imageUrl ? `<div style="margin-top: 30px; text-align: center;"><img src="${imageUrl}" alt="Email Image" style="max-width: 100%; height: auto; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);" onerror="this.style.display='none';" /></div>` : ''}
+            <td style="padding: 40px 30px; font-size: 16px; line-height: 24px; color: #333333; font-family: Arial, Helvetica, sans-serif;">
+              ${content}
+              ${imageUrl ? `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top: 30px;"><tr><td align="center"><img src="${imageUrl}" alt="Email Image" width="100%" style="display: block; max-width: 100%; height: auto; border: 0; outline: none; text-decoration: none;" /></td></tr></table>` : ''}
             </td>
           </tr>
           
           <!-- Closing Message -->
           <tr>
-            <td style="padding: 0 30px 30px 30px;">
-              <p style="margin: 0; font-size: 16px; font-weight: 600; color: #2d3748; line-height: 1.8;">
-                Happy Trading!<br><br>
-                The ${companyName} Team
-              </p>
+            <td style="padding: 0 30px 30px 30px; font-size: 16px; line-height: 24px; color: #333333; font-family: Arial, Helvetica, sans-serif;">
+              <p style="margin: 0 0 10px 0; font-weight: bold;">Happy Trading!</p>
+              <p style="margin: 0;">The ${companyName} Team</p>
             </td>
           </tr>
           
           <!-- Footer Section -->
           <tr>
-            <td style="background-color: #f7fafc; padding: 40px 30px; border-top: 1px solid #e2e8f0;">
+            <td bgcolor="#f7fafc" style="background-color: #f7fafc; padding: 40px 30px; border-top: 1px solid #e2e8f0;">
               <!-- Need Assistance -->
-              <div style="margin-bottom: 30px;">
-                <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: 700; color: #1a202c;">NEED ASSISTANCE?</h3>
-                <p style="margin: 0 0 10px 0; font-size: 14px; line-height: 1.8; color: #4a5568;">
-                  Feel free to reach out to us at <a href="mailto:${companyEmail}" style="color: #667eea; text-decoration: none; font-weight: 600;">${companyEmail}</a> or call us at <a href="tel:${companyPhone.replace(/\s/g, '')}" style="color: #667eea; text-decoration: none; font-weight: 600;">${companyPhone}</a>.
-                </p>
-              </div>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom: 30px;">
+                <tr>
+                  <td style="font-size: 16px; font-weight: bold; color: #1a202c; font-family: Arial, Helvetica, sans-serif; padding-bottom: 10px;">NEED ASSISTANCE?</td>
+                </tr>
+                <tr>
+                  <td style="font-size: 14px; line-height: 22px; color: #4a5568; font-family: Arial, Helvetica, sans-serif;">
+                    Feel free to reach out to us at <a href="mailto:${companyEmail}" style="color: #667eea; text-decoration: underline; font-weight: bold;">${companyEmail}</a> or call us at <a href="tel:${companyPhone.replace(/\s/g, '')}" style="color: #667eea; text-decoration: underline; font-weight: bold;">${companyPhone}</a>.
+                  </td>
+                </tr>
+              </table>
               
               <!-- Company Info -->
-              <div style="margin-bottom: 30px; padding-top: 20px; border-top: 1px solid #e2e8f0;">
-                <p style="margin: 0 0 15px 0; font-size: 13px; line-height: 1.8; color: #718096;">
-                  ${companyName} is the trading name of Zuperior FX Limited, a reputable financial services company licensed under Investment and Legal Services LTD, located at Ground Floor, The Sotheby Building, Saint Lucia. Zuperior FX Limited, registered in Saint Lucia (Reg. No. 2025-00585), is dedicated to providing traders worldwide with fast, secure, and transparent trading experiences supported by cutting-edge technology and strict regulatory compliance.
-                </p>
-              </div>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom: 30px; padding-top: 20px; border-top: 1px solid #e2e8f0;">
+                <tr>
+                  <td style="font-size: 13px; line-height: 20px; color: #718096; font-family: Arial, Helvetica, sans-serif;">
+                    ${companyName} is the trading name of Zuperior FX Limited, a reputable financial services company licensed under Investment and Legal Services LTD, located at Ground Floor, The Sotheby Building, Saint Lucia. Zuperior FX Limited, registered in Saint Lucia (Reg. No. 2025-00585), is dedicated to providing traders worldwide with fast, secure, and transparent trading experiences supported by cutting-edge technology and strict regulatory compliance.
+                  </td>
+                </tr>
+              </table>
               
               <!-- Risk Warning -->
-              <div style="margin-bottom: 30px; padding: 20px; background-color: #fff5f5; border-left: 4px solid #fc8181; border-radius: 4px;">
-                <h4 style="margin: 0 0 10px 0; font-size: 14px; font-weight: 700; color: #c53030;">RISK WARNING AND DISCLOSURE:</h4>
-                <p style="margin: 0; font-size: 12px; line-height: 1.7; color: #742a2a;">
-                  Trading leveraged financial instruments such as Forex, CFDs, and Commodities carries a significant risk of loss and may not be suitable for all investors. Due to the high level of leverage, you may lose more than your initial investment. Please ensure you fully understand the risks involved and seek advice from an independent financial advisor if necessary before engaging in any trading activities.
-                </p>
-              </div>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom: 30px;">
+                <tr>
+                  <td bgcolor="#fff5f5" style="background-color: #fff5f5; padding: 20px; border-left: 4px solid #fc8181;">
+                    <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                      <tr>
+                        <td style="font-size: 14px; font-weight: bold; color: #c53030; font-family: Arial, Helvetica, sans-serif; padding-bottom: 10px;">RISK WARNING AND DISCLOSURE:</td>
+                      </tr>
+                      <tr>
+                        <td style="font-size: 12px; line-height: 18px; color: #742a2a; font-family: Arial, Helvetica, sans-serif;">
+                          Trading leveraged financial instruments such as Forex, CFDs, and Commodities carries a significant risk of loss and may not be suitable for all investors. Due to the high level of leverage, you may lose more than your initial investment. Please ensure you fully understand the risks involved and seek advice from an independent financial advisor if necessary before engaging in any trading activities.
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
               
               <!-- Restricted Regions -->
-              <div style="margin-bottom: 30px; padding: 20px; background-color: #fffaf0; border-left: 4px solid #f6ad55; border-radius: 4px;">
-                <h4 style="margin: 0 0 10px 0; font-size: 14px; font-weight: 700; color: #c05621;">RESTRICTED REGIONS:</h4>
-                <p style="margin: 0; font-size: 12px; line-height: 1.7; color: #744210;">
-                  Zuperior FX Limited strictly prohibits providing services to residents of the United States, Cuba, Iraq, Myanmar, North Korea, Sudan, and any other jurisdictions where such activities are restricted or prohibited by local law. Our services are intended solely for clients in compliant regions and those who fully comply with all applicable legal requirements.
-                </p>
-              </div>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom: 30px;">
+                <tr>
+                  <td bgcolor="#fffaf0" style="background-color: #fffaf0; padding: 20px; border-left: 4px solid #f6ad55;">
+                    <table width="100%" cellpadding="0" cellspacing="0" border="0">
+                      <tr>
+                        <td style="font-size: 14px; font-weight: bold; color: #c05621; font-family: Arial, Helvetica, sans-serif; padding-bottom: 10px;">RESTRICTED REGIONS:</td>
+                      </tr>
+                      <tr>
+                        <td style="font-size: 12px; line-height: 18px; color: #744210; font-family: Arial, Helvetica, sans-serif;">
+                          Zuperior FX Limited strictly prohibits providing services to residents of the United States, Cuba, Iraq, Myanmar, North Korea, Sudan, and any other jurisdictions where such activities are restricted or prohibited by local law. Our services are intended solely for clients in compliant regions and those who fully comply with all applicable legal requirements.
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
               
               <!-- Copyright -->
-              <div style="margin-bottom: 20px; padding-top: 20px; border-top: 1px solid #e2e8f0; text-align: center;">
-                <p style="margin: 0 0 15px 0; font-size: 12px; color: #718096;">
-                  © ${currentYear} Zuperior FX Limited. All rights reserved.
-                </p>
-              </div>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom: 20px; padding-top: 20px; border-top: 1px solid #e2e8f0;">
+                <tr>
+                  <td align="center" style="font-size: 12px; color: #718096; font-family: Arial, Helvetica, sans-serif;">
+                    © ${currentYear} Zuperior FX Limited. All rights reserved.
+                  </td>
+                </tr>
+              </table>
               
               <!-- Confidentiality Notice -->
-              <div style="padding-top: 20px; border-top: 1px solid #e2e8f0;">
-                <p style="margin: 0; font-size: 11px; line-height: 1.6; color: #a0aec0; font-style: italic;">
-                  <strong>Confidentiality Notice:</strong> This communication is intended solely for the designated recipient(s) and may contain confidential or privileged information. If you are not an intended recipient, any disclosure, copying, distribution, or use of its contents is strictly prohibited and may be unlawful. Please notify the sender immediately and delete all copies. The sender is not liable for incomplete or delayed transmission of this communication.
-                </p>
-              </div>
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="padding-top: 20px; border-top: 1px solid #e2e8f0;">
+                <tr>
+                  <td style="font-size: 11px; line-height: 16px; color: #a0aec0; font-style: italic; font-family: Arial, Helvetica, sans-serif;">
+                    <strong style="font-weight: bold;">Confidentiality Notice:</strong> This communication is intended solely for the designated recipient(s) and may contain confidential or privileged information. If you are not an intended recipient, any disclosure, copying, distribution, or use of its contents is strictly prohibited and may be unlawful. Please notify the sender immediately and delete all copies. The sender is not liable for incomplete or delayed transmission of this communication.
+                  </td>
+                </tr>
+              </table>
             </td>
           </tr>
         </table>
@@ -2714,8 +2747,7 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
     </tr>
   </table>
 </body>
-</html>
-      `;
+</html>`;
     };
 
     // Helper function to get recipient name with fallback
@@ -2850,11 +2882,15 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
         // Call external email API
         let apiResponse;
         try {
+          // Use template's from_email if available, otherwise use default
+          const fromEmail = selectedTemplate?.from_email || process.env.FROM_EMAIL || process.env.SMTP_USER || 'info@zuperior.com';
+          
           const requestPayload = {
             recipient_email: user.email,
             subject: finalSubject || 'Email',
             content_body: userContentBody,
             is_html: finalIsHtml,
+            from_email: fromEmail, // Include from_email in payload
           };
           
           // Only include attachments if there are any
@@ -2862,7 +2898,7 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
             requestPayload.attachments = apiAttachments;
           }
           
-          console.log(`[Email API] Sending email to ${user.email} via ${EMAIL_API_URL}`);
+          console.log(`[Email API] Sending email to ${user.email} from ${fromEmail} via ${EMAIL_API_URL}`);
           console.log(`[Email API] Payload size: ${JSON.stringify(requestPayload).length} bytes`);
           
           // Build headers
@@ -3192,7 +3228,7 @@ app.get('/admin/email-templates/:id', authenticateAdmin, async (req, res) => {
 // Create new email template
 app.post('/admin/email-templates', authenticateAdmin, async (req, res) => {
   try {
-    const { name, description, html_code, variables = [], preview_image_url, is_default = false } = req.body || {};
+    const { name, description, html_code, variables = [], from_email, is_default = false } = req.body || {};
     const adminId = req.admin?.id?.toString() || req.admin?.username || null;
 
     if (!name || !html_code) {
@@ -3234,7 +3270,7 @@ app.post('/admin/email-templates', authenticateAdmin, async (req, res) => {
       html_code,
       variables: Array.isArray(variables) ? variables : [],
       is_default: shouldBeDefault,
-      preview_image_url: preview_image_url || null,
+      from_email: from_email || null,
       created_by: adminId,
       created_at: new Date(),
       updated_at: new Date(),
@@ -3251,7 +3287,7 @@ app.post('/admin/email-templates', authenticateAdmin, async (req, res) => {
 app.put('/admin/email-templates/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, description, html_code, variables, preview_image_url, is_default } = req.body || {};
+    const { name, description, html_code, variables, from_email, is_default } = req.body || {};
 
     const existingTemplate = await getEmailTemplateById(Number(id));
     if (!existingTemplate) {
@@ -3290,7 +3326,7 @@ app.put('/admin/email-templates/:id', authenticateAdmin, async (req, res) => {
     if (description !== undefined) updateData.description = description;
     if (html_code !== undefined) updateData.html_code = html_code;
     if (variables !== undefined) updateData.variables = Array.isArray(variables) ? variables : [];
-    if (preview_image_url !== undefined) updateData.preview_image_url = preview_image_url;
+    if (from_email !== undefined) updateData.from_email = from_email;
     if (is_default !== undefined) updateData.is_default = is_default;
     updateData.updated_at = new Date();
 
