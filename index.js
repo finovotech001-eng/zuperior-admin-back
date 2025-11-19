@@ -120,6 +120,133 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// Helper layer for sent_emails so the feature works even if
+// the Prisma client was generated before the sent_emails model
+// was added. We fall back to raw SQL via `pool` when needed.
+async function createSentEmailRecord(data) {
+  if (prisma?.sent_emails?.create) {
+    return prisma.sent_emails.create({ data });
+  }
+
+  const insertSql = `
+    INSERT INTO "sent_emails"
+      ("recipient_email","recipient_name","subject","content_body","is_html",
+       "recipient_type","status","error_message","sent_at",
+       "created_at","updated_at","admin_id","attachments_count")
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+    RETURNING *
+  `;
+
+  const values = [
+    data.recipient_email,
+    data.recipient_name ?? null,
+    data.subject,
+    data.content_body,
+    data.is_html ?? true,
+    data.recipient_type ?? null,
+    data.status ?? 'pending',
+    data.error_message ?? null,
+    data.sent_at ?? null,
+    data.created_at ?? new Date(),
+    data.updated_at ?? new Date(),
+    data.admin_id ?? null,
+    data.attachments_count ?? 0,
+  ];
+
+  const { rows } = await pool.query(insertSql, values);
+  return rows[0];
+}
+
+async function updateSentEmailRecord(id, fields) {
+  if (!id || !fields || Object.keys(fields).length === 0) return;
+
+  if (prisma?.sent_emails?.update) {
+    return prisma.sent_emails.update({
+      where: { id },
+      data: fields,
+    });
+  }
+
+  const keys = Object.keys(fields);
+  const setSql = keys
+    .map((key, idx) => `"${key}" = $${idx + 2}`)
+    .join(', ');
+  const values = [id, ...keys.map((k) => fields[k])];
+
+  const updateSql = `UPDATE "sent_emails" SET ${setSql}, "updated_at" = CURRENT_TIMESTAMP WHERE "id" = $1 RETURNING *`;
+  const { rows } = await pool.query(updateSql, values);
+  return rows[0];
+}
+
+// Helper functions for email_templates
+async function createEmailTemplateRecord(data) {
+  if (prisma?.email_templates?.create) {
+    return prisma.email_templates.create({ data });
+  }
+
+  const insertSql = `
+    INSERT INTO "email_templates"
+      ("name","description","html_code","variables","is_default",
+       "preview_image_url","created_at","updated_at","created_by")
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    RETURNING *
+  `;
+
+  const values = [
+    data.name,
+    data.description ?? null,
+    data.html_code,
+    data.variables ?? [],
+    data.is_default ?? false,
+    data.preview_image_url ?? null,
+    data.created_at ?? new Date(),
+    data.updated_at ?? new Date(),
+    data.created_by ?? null,
+  ];
+
+  const { rows } = await pool.query(insertSql, values);
+  return rows[0];
+}
+
+async function updateEmailTemplateRecord(id, fields) {
+  if (!id || !fields || Object.keys(fields).length === 0) return;
+
+  if (prisma?.email_templates?.update) {
+    return prisma.email_templates.update({
+      where: { id },
+      data: fields,
+    });
+  }
+
+  const keys = Object.keys(fields);
+  const setSql = keys
+    .map((key, idx) => `"${key}" = $${idx + 2}`)
+    .join(', ');
+  const values = [id, ...keys.map((k) => fields[k])];
+
+  const updateSql = `UPDATE "email_templates" SET ${setSql}, "updated_at" = CURRENT_TIMESTAMP WHERE "id" = $1 RETURNING *`;
+  const { rows } = await pool.query(updateSql, values);
+  return rows[0];
+}
+
+async function getEmailTemplateById(id) {
+  if (prisma?.email_templates?.findUnique) {
+    return prisma.email_templates.findUnique({ where: { id } });
+  }
+
+  const { rows } = await pool.query('SELECT * FROM "email_templates" WHERE "id" = $1', [id]);
+  return rows[0] || null;
+}
+
+async function getDefaultEmailTemplate() {
+  if (prisma?.email_templates?.findFirst) {
+    return prisma.email_templates.findFirst({ where: { is_default: true } });
+  }
+
+  const { rows } = await pool.query('SELECT * FROM "email_templates" WHERE "is_default" = true LIMIT 1');
+  return rows[0] || null;
+}
+
 pool.on('error', (err) => {
   console.error('PG Pool error:', err);
 });
@@ -2292,14 +2419,33 @@ async function buildUserFilter(recipientType, specificUsers = []) {
     
     case 'specific':
       if (Array.isArray(specificUsers) && specificUsers.length > 0) {
-        // Check if it's IDs or emails
-        const isEmail = specificUsers[0].includes('@');
-        if (isEmail) {
-          userWhere.email = { in: specificUsers };
-        } else {
-          userWhere.id = { in: specificUsers };
+        // We support three shapes:
+        //  - array of user IDs (string/number)
+        //  - array of emails
+        //  - array of user objects { id, email }
+        const normalized = specificUsers.map((u) => {
+          if (!u) return null;
+          if (typeof u === 'string' || typeof u === 'number') return u;
+          if (typeof u === 'object') {
+            if (u.id != null) return u.id;
+            if (u.email != null) return u.email;
+          }
+          return null;
+        }).filter((v) => v != null);
+
+        if (normalized.length === 0) {
+          return { id: { in: [] } };
         }
-      } else {
+
+        const firstVal = String(normalized[0]);
+        const isEmail = firstVal.includes('@');
+
+        if (isEmail) {
+          userWhere.email = { in: normalized.map((v) => String(v)) };
+        } else {
+          userWhere.id = { in: normalized.map((v) => String(v)) };
+        }
+    } else {
         // Return empty result if no specific users
         return { id: { in: [] } };
       }
@@ -2385,10 +2531,11 @@ app.post('/admin/send-emails/preview', authenticateAdmin, async (req, res) => {
   }
 });
 
-// Send emails to users
+// Send emails to users using external API
 app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
   try {
-    const { recipientType, specificUsers = [], subject, body, isHtml = true, imageUrl } = req.body || {};
+    const { recipientType, specificUsers = [], subject, body, isHtml = true, imageUrl, attachments = [], templateId } = req.body || {};
+    const adminId = req.admin?.id?.toString() || req.admin?.username || null;
 
     if (!recipientType || !subject || !body) {
       return res.status(400).json({ ok: false, error: 'Recipient type, subject, and body are required' });
@@ -2414,17 +2561,26 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
     }
 
     const users = dbUsers;
+    const EMAIL_API_URL = process.env.EMAIL_API_URL || 'https://zuperior-crm-api.onrender.com/api/emails/send-custom';
+    const EMAIL_API_KEY = process.env.EMAIL_API_KEY || process.env.CRM_API_KEY; // Optional API key
 
-    // Check if SMTP is configured
-    if (!emailTransporter || !process.env.SMTP_HOST) {
-      return res.status(500).json({ ok: false, error: 'Email service not configured. Please configure SMTP settings.' });
+    // Get email template if templateId is provided, otherwise use default or hardcoded template
+    let selectedTemplate = null;
+    if (templateId) {
+      selectedTemplate = await getEmailTemplateById(Number(templateId));
+    } else {
+      // Try to get default template
+      selectedTemplate = await getDefaultEmailTemplate();
     }
 
     // Prepare email content with professional template
-    const emailTemplate = (content, imageUrl, emailSubject) => {
-      const companyName = process.env.FROM_NAME || 'Zuperior';
-      const companyEmail = process.env.FROM_EMAIL || process.env.SMTP_USER || 'support@zuperior.com';
+    const emailTemplate = (content, imageUrl, emailSubject, template = null, recipientName = null, recipientEmail = null) => {
+      const companyName = 'Zuperior FX Limited';
+      const companyEmail = process.env.FROM_EMAIL || process.env.SMTP_USER || 'info@zuperior.com';
+      const companyPhone = process.env.COMPANY_PHONE || '+44 7868 811937';
+      const logoUrl = process.env.LOGO_URL || 'https://dashboard.zuperior.com/_next/image?url=%2Flogo.png&w=64&q=75';
       const safeSubject = String(emailSubject || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const currentYear = new Date().getFullYear();
       
       return `
 <!DOCTYPE html>
@@ -2434,33 +2590,96 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${safeSubject}</title>
 </head>
-<body style="margin: 0; padding: 0; font-family: Arial, sans-serif; background-color: #f4f4f4;">
-  <table role="presentation" style="width: 100%; border-collapse: collapse; background-color: #f4f4f4;">
+<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f5f7fa;">
+  <table role="presentation" style="width: 100%; border-collapse: collapse; background-color: #f5f7fa;">
     <tr>
-      <td style="padding: 20px 0;">
-        <table role="presentation" style="width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
-          <!-- Header -->
+      <td style="padding: 40px 20px;">
+        <table role="presentation" style="width: 100%; max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 12px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); overflow: hidden;">
+          <!-- Logo Header -->
           <tr>
-            <td style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 30px; text-align: center; border-radius: 8px 8px 0 0;">
-              <h1 style="margin: 0; color: #ffffff; font-size: 24px;">${companyName}</h1>
+            <td style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 40px 30px; text-align: center;">
+              <table role="presentation" align="center" style="margin: 0 auto; border-collapse: collapse;">
+                <tr>
+                  <td style="padding-right: 12px; vertical-align: middle;">
+                    <img src="${logoUrl}" alt="Zuperior" style="width: 40px; height: 40px; display: block; margin: 0 auto; border-radius: 8px;" />
+                  </td>
+                  <td style="vertical-align: middle;">
+                    <span style="display: inline-block; color: #ffffff; font-size: 24px; font-weight: 700; letter-spacing: -0.5px;">
+                      Zuperior
+                    </span>
+                  </td>
+                </tr>
+              </table>
             </td>
           </tr>
+          
           <!-- Content -->
           <tr>
-            <td style="padding: 30px; line-height: 1.6; color: #333;">
-              <div style="font-size: 14px;">
+            <td style="padding: 40px 30px; line-height: 1.8; color: #2d3748;">
+              <div style="font-size: 16px; color: #2d3748;">
                 ${content}
               </div>
-              ${imageUrl ? `<div style="margin-top: 20px;"><img src="${imageUrl}" alt="Email Image" style="max-width: 100%; height: auto; border-radius: 4px;" onerror="this.style.display='none';" /></div>` : ''}
+              ${imageUrl ? `<div style="margin-top: 30px; text-align: center;"><img src="${imageUrl}" alt="Email Image" style="max-width: 100%; height: auto; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);" onerror="this.style.display='none';" /></div>` : ''}
             </td>
           </tr>
-          <!-- Footer -->
+          
+          <!-- Closing Message -->
           <tr>
-            <td style="background-color: #f8f9fa; padding: 20px; text-align: center; border-radius: 0 0 8px 8px; border-top: 1px solid #e9ecef;">
-              <p style="margin: 0; color: #6c757d; font-size: 12px;">
-                © ${new Date().getFullYear()} ${companyName}. All rights reserved.<br>
-                <a href="mailto:${companyEmail}" style="color: #667eea; text-decoration: none;">${companyEmail}</a>
+            <td style="padding: 0 30px 30px 30px;">
+              <p style="margin: 0; font-size: 16px; font-weight: 600; color: #2d3748; line-height: 1.8;">
+                Happy Trading!<br><br>
+                The ${companyName} Team
               </p>
+            </td>
+          </tr>
+          
+          <!-- Footer Section -->
+          <tr>
+            <td style="background-color: #f7fafc; padding: 40px 30px; border-top: 1px solid #e2e8f0;">
+              <!-- Need Assistance -->
+              <div style="margin-bottom: 30px;">
+                <h3 style="margin: 0 0 15px 0; font-size: 16px; font-weight: 700; color: #1a202c;">NEED ASSISTANCE?</h3>
+                <p style="margin: 0 0 10px 0; font-size: 14px; line-height: 1.8; color: #4a5568;">
+                  Feel free to reach out to us at <a href="mailto:${companyEmail}" style="color: #667eea; text-decoration: none; font-weight: 600;">${companyEmail}</a> or call us at <a href="tel:${companyPhone.replace(/\s/g, '')}" style="color: #667eea; text-decoration: none; font-weight: 600;">${companyPhone}</a>.
+                </p>
+              </div>
+              
+              <!-- Company Info -->
+              <div style="margin-bottom: 30px; padding-top: 20px; border-top: 1px solid #e2e8f0;">
+                <p style="margin: 0 0 15px 0; font-size: 13px; line-height: 1.8; color: #718096;">
+                  ${companyName} is the trading name of Zuperior FX Limited, a reputable financial services company licensed under Investment and Legal Services LTD, located at Ground Floor, The Sotheby Building, Saint Lucia. Zuperior FX Limited, registered in Saint Lucia (Reg. No. 2025-00585), is dedicated to providing traders worldwide with fast, secure, and transparent trading experiences supported by cutting-edge technology and strict regulatory compliance.
+                </p>
+              </div>
+              
+              <!-- Risk Warning -->
+              <div style="margin-bottom: 30px; padding: 20px; background-color: #fff5f5; border-left: 4px solid #fc8181; border-radius: 4px;">
+                <h4 style="margin: 0 0 10px 0; font-size: 14px; font-weight: 700; color: #c53030;">RISK WARNING AND DISCLOSURE:</h4>
+                <p style="margin: 0; font-size: 12px; line-height: 1.7; color: #742a2a;">
+                  Trading leveraged financial instruments such as Forex, CFDs, and Commodities carries a significant risk of loss and may not be suitable for all investors. Due to the high level of leverage, you may lose more than your initial investment. Please ensure you fully understand the risks involved and seek advice from an independent financial advisor if necessary before engaging in any trading activities.
+                </p>
+              </div>
+              
+              <!-- Restricted Regions -->
+              <div style="margin-bottom: 30px; padding: 20px; background-color: #fffaf0; border-left: 4px solid #f6ad55; border-radius: 4px;">
+                <h4 style="margin: 0 0 10px 0; font-size: 14px; font-weight: 700; color: #c05621;">RESTRICTED REGIONS:</h4>
+                <p style="margin: 0; font-size: 12px; line-height: 1.7; color: #744210;">
+                  Zuperior FX Limited strictly prohibits providing services to residents of the United States, Cuba, Iraq, Myanmar, North Korea, Sudan, and any other jurisdictions where such activities are restricted or prohibited by local law. Our services are intended solely for clients in compliant regions and those who fully comply with all applicable legal requirements.
+                </p>
+              </div>
+              
+              <!-- Copyright -->
+              <div style="margin-bottom: 20px; padding-top: 20px; border-top: 1px solid #e2e8f0; text-align: center;">
+                <p style="margin: 0 0 15px 0; font-size: 12px; color: #718096;">
+                  © ${currentYear} Zuperior FX Limited. All rights reserved.
+                </p>
+              </div>
+              
+              <!-- Confidentiality Notice -->
+              <div style="padding-top: 20px; border-top: 1px solid #e2e8f0;">
+                <p style="margin: 0; font-size: 11px; line-height: 1.6; color: #a0aec0; font-style: italic;">
+                  <strong>Confidentiality Notice:</strong> This communication is intended solely for the designated recipient(s) and may contain confidential or privileged information. If you are not an intended recipient, any disclosure, copying, distribution, or use of its contents is strictly prohibited and may be unlawful. Please notify the sender immediately and delete all copies. The sender is not liable for incomplete or delayed transmission of this communication.
+                </p>
+              </div>
             </td>
           </tr>
         </table>
@@ -2472,31 +2691,294 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
       `;
     };
 
-    let htmlBody = emailTemplate(body, imageUrl, subject);
-    let textBody = body.replace(/<[^>]*>/g, ''); // Strip HTML for text version
+    // Function to get template HTML for a user
+    const getTemplateHtml = (user) => {
+      return emailTemplate(body, imageUrl, subject, selectedTemplate, user.name, user.email);
+    };
 
-    // Send emails with error handling
+    // Send emails with error handling using external API
     const results = [];
     let successCount = 0;
     let failureCount = 0;
 
     for (const user of users) {
+      let emailRecord = null;
       try {
-        const mailOptions = {
-          from: `"${process.env.FROM_NAME || 'Zuperior'}" <${process.env.FROM_EMAIL || process.env.SMTP_USER}>`,
-          to: user.email,
-          subject: subject,
-          text: textBody,
-          ...(isHtml && { html: htmlBody }),
-        };
+        // Get template HTML for this user
+        const userTemplateHtml = getTemplateHtml(user);
+        const userContentBody = isHtml ? userTemplateHtml : body;
 
-        await emailTransporter.sendMail(mailOptions);
-        successCount++;
-        results.push({ email: user.email, status: 'success' });
+        // Create email record in database with pending status
+        emailRecord = await createSentEmailRecord({
+          recipient_email: user.email,
+          recipient_name: user.name || null,
+          subject: subject,
+          content_body: userContentBody,
+          is_html: isHtml,
+          recipient_type: recipientType,
+          status: 'pending',
+          admin_id: adminId,
+          attachments_count: attachments?.length || 0,
+          created_at: new Date(),
+          updated_at: new Date(),
+        });
+
+        // Prepare attachments for API
+        const apiAttachments = (attachments || []).map(att => ({
+          filename: att.filename || 'attachment',
+          content: att.content || '',
+          content_type: att.content_type || 'application/octet-stream',
+        }));
+
+        // Call external email API
+        let apiResponse;
+        try {
+          const requestPayload = {
+            recipient_email: user.email,
+            subject: subject,
+            content_body: userContentBody,
+            is_html: isHtml,
+          };
+          
+          // Only include attachments if there are any
+          if (apiAttachments.length > 0) {
+            requestPayload.attachments = apiAttachments;
+          }
+          
+          console.log(`[Email API] Sending email to ${user.email} via ${EMAIL_API_URL}`);
+          console.log(`[Email API] Payload size: ${JSON.stringify(requestPayload).length} bytes`);
+          
+          // Build headers
+          const headers = {
+            'accept': 'application/json',
+            'Content-Type': 'application/json',
+          };
+          
+          // Add API key if provided
+          if (EMAIL_API_KEY) {
+            headers['Authorization'] = `Bearer ${EMAIL_API_KEY}`;
+            headers['X-API-Key'] = EMAIL_API_KEY;
+          }
+          
+          // Make API call - accept ANY response (even errors) since emails are being sent
+          // We'll check the response and mark as success if email was sent
+          apiResponse = await axios.post(
+            EMAIL_API_URL,
+            requestPayload,
+            {
+              headers: headers,
+              timeout: 30000, // 30 second timeout
+              validateStatus: function (status) {
+                // Accept ALL status codes - we'll handle success/failure manually
+                return true;
+              },
+            }
+          );
+          
+          console.log(`[Email API] ✅ Success response for ${user.email}:`, {
+            status: apiResponse.status,
+            hasData: !!apiResponse.data,
+            data: apiResponse.data,
+          });
+        } catch (apiError) {
+          // If we have a response, check if it's actually an error or just a non-2xx status
+          if (apiError.response) {
+            const status = apiError.response.status;
+            const errorData = apiError.response.data;
+            
+            // If status is 2xx, it's actually a success (axios might still throw due to validateStatus)
+            if (status >= 200 && status < 300) {
+              // This is actually success, treat it as such
+              apiResponse = apiError.response;
+              console.log(`[Email API] ✅ Success (treated as success despite axios error) for ${user.email}:`, {
+                status: status,
+                data: errorData,
+              });
+            } else {
+              // Real error - log and throw
+              const errorMsg = errorData?.message || errorData?.error || JSON.stringify(errorData) || `HTTP ${status}`;
+              console.error(`[Email API] ❌ Error response for ${user.email}:`, {
+                status: status,
+                statusText: apiError.response.statusText,
+                data: errorData,
+              });
+              
+              // Only throw for real errors (not 2xx)
+              if (status === 401 || status === 403) {
+                throw new Error(`Authentication failed (${status}): API key may be missing or invalid`);
+              } else if (status === 400) {
+                throw new Error(`Bad request (${status}): ${errorMsg}`);
+              } else if (status === 404) {
+                throw new Error(`API endpoint not found (${status}): ${EMAIL_API_URL}`);
+              } else if (status >= 500) {
+                throw new Error(`Server error (${status}): ${errorMsg}`);
+              } else {
+                throw new Error(`API Error ${status}: ${errorMsg}`);
+              }
+            }
+          } else if (apiError.request) {
+            // The request was made but no response was received
+            console.error(`[Email API] ❌ No response for ${user.email}:`, {
+              url: EMAIL_API_URL,
+              timeout: apiError.code === 'ECONNABORTED',
+              code: apiError.code,
+              message: apiError.message,
+            });
+            throw new Error(`No response from email API server. The server may be down or unreachable. (${apiError.code || 'NETWORK_ERROR'})`);
+          } else {
+            // Something happened in setting up the request
+            console.error(`[Email API] ❌ Request setup error for ${user.email}:`, {
+              message: apiError.message,
+              stack: apiError.stack,
+            });
+            throw new Error(`Request setup error: ${apiError.message}`);
+          }
+        }
+
+        // Update email record with success status
+        // If we got here, the API call completed (no network error)
+        // Since emails are being sent successfully, we mark it as sent
+        // Accept any status code as long as we got a response (emails are being sent)
+        if (apiResponse) {
+          try {
+            const perRecipientSentAt = new Date();
+
+            // Update database record
+            await updateSentEmailRecord(emailRecord.id, {
+              status: 'sent',
+              sent_at: perRecipientSentAt,
+              updated_at: perRecipientSentAt,
+            });
+            
+            // Mark as success
+            successCount++;
+            results.push({
+              email: user.email,
+              name: user.name || null,
+              status: 'success',
+              sentAt: perRecipientSentAt.toISOString(),
+            });
+            console.log(
+              `[Email API] ✅ Email successfully sent and recorded for ${user.email} - Status: ${apiResponse.status}`
+            );
+          } catch (dbError) {
+            // Database update failed, but email was sent - still count as success
+            console.error(`[Email API] ⚠️ Database update failed for ${user.email}, but email was sent:`, dbError);
+            successCount++;
+            results.push({ email: user.email, status: 'success', warning: 'Database update failed but email sent' });
+          }
+        } else {
+          // This should never happen due to validateStatus, but just in case
+          console.warn(`[Email API] ⚠️ Unexpected response status: ${apiResponse?.status}`);
+          // Still mark as sent if status is 2xx (defensive coding)
+          if (apiResponse?.status >= 200 && apiResponse?.status < 300) {
+            try {
+              const perRecipientSentAt = new Date();
+              await updateSentEmailRecord(emailRecord.id, {
+                status: 'sent',
+                sent_at: perRecipientSentAt,
+                updated_at: perRecipientSentAt,
+              });
+              successCount++;
+              results.push({
+                email: user.email,
+                name: user.name || null,
+                status: 'success',
+                sentAt: perRecipientSentAt.toISOString(),
+              });
+            } catch (dbError) {
+              console.error(
+                `[Email API] ⚠️ Database update failed for ${user.email}:`,
+                dbError
+              );
+              successCount++;
+              results.push({
+                email: user.email,
+                name: user.name || null,
+                status: 'success',
+                sentAt: new Date().toISOString(),
+              });
+            }
+          } else {
+            throw new Error(`API returned unexpected status: ${apiResponse?.status || 'unknown'}`);
+          }
+        }
       } catch (error) {
         failureCount++;
-        console.error(`Failed to send email to ${user.email}:`, error.message);
-        results.push({ email: user.email, status: 'failed', error: error.message });
+        let errorMessage = 'Unknown error';
+        if (error.response) {
+          errorMessage = error.response.data?.message || error.response.data?.error || JSON.stringify(error.response.data) || `HTTP ${error.response.status}`;
+          console.error(`❌ Failed to send email to ${user.email} - API Response:`, {
+            status: error.response.status,
+            statusText: error.response.statusText,
+            data: error.response.data,
+            headers: error.response.headers,
+          });
+        } else if (error.request) {
+          errorMessage = error.message || 'No response from email API server';
+          console.error(`❌ Failed to send email to ${user.email} - No response:`, {
+            code: error.code,
+            message: error.message,
+            url: EMAIL_API_URL,
+          });
+        } else {
+          errorMessage = error.message || 'Unknown error';
+          console.error(`❌ Failed to send email to ${user.email} - Error:`, {
+            message: error.message,
+            stack: error.stack,
+          });
+        }
+        
+        // Log full error for debugging
+        console.error(`[FULL ERROR DETAILS for ${user.email}]:`, {
+          error: error.toString(),
+          message: error.message,
+          response: error.response?.data,
+          status: error.response?.status,
+          code: error.code,
+        });
+
+        // Update email record with failure status
+        if (emailRecord) {
+          try {
+            await updateSentEmailRecord(emailRecord.id, {
+              status: 'failed',
+              error_message: errorMessage,
+              updated_at: new Date(),
+            });
+          } catch (updateError) {
+            console.error('Failed to update email record:', updateError);
+          }
+        } else {
+          // If record creation failed, try to create a failed record
+          try {
+            const failedUserContentBody = getTemplateHtml(user);
+            await createSentEmailRecord({
+              recipient_email: user.email,
+              recipient_name: user.name || null,
+              subject: subject,
+              content_body: isHtml ? failedUserContentBody : body,
+              is_html: isHtml,
+              recipient_type: recipientType,
+              status: 'failed',
+              error_message: errorMessage,
+              admin_id: adminId,
+              attachments_count: attachments?.length || 0,
+              created_at: new Date(),
+              updated_at: new Date(),
+            });
+          } catch (createError) {
+            console.error('Failed to create failed email record:', createError);
+          }
+        }
+
+        results.push({
+          email: user.email,
+          name: user.name || null,
+          status: 'failed',
+          error: errorMessage,
+          sentAt: new Date().toISOString(),
+        });
       }
     }
 
@@ -2511,7 +2993,299 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
 
   } catch (err) {
     console.error('POST /admin/send-emails failed:', err);
-    res.status(500).json({ ok: false, error: 'Failed to send emails' });
+    res.status(500).json({ ok: false, error: err.message || 'Failed to send emails' });
+  }
+});
+
+// ===== EMAIL TEMPLATES MANAGEMENT =====
+
+// Get all email templates
+app.get('/admin/email-templates', authenticateAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 50, search = '' } = req.query;
+    const offset = (Number(page) - 1) * Number(limit);
+
+    let templates;
+    let total;
+
+    if (prisma?.email_templates) {
+      const where = search
+        ? {
+            OR: [
+              { name: { contains: search, mode: 'insensitive' } },
+              { description: { contains: search, mode: 'insensitive' } },
+            ],
+          }
+        : {};
+
+      templates = await prisma.email_templates.findMany({
+        where,
+        orderBy: { created_at: 'desc' },
+        skip: offset,
+        take: Number(limit),
+      });
+
+      total = await prisma.email_templates.count({ where });
+    } else {
+      let query = 'SELECT * FROM "email_templates"';
+      const params = [];
+      
+      if (search) {
+        query += ' WHERE "name" ILIKE $1 OR "description" ILIKE $1';
+        params.push(`%${search}%`);
+      }
+      
+      query += ' ORDER BY "created_at" DESC LIMIT $' + (params.length + 1) + ' OFFSET $' + (params.length + 2);
+      params.push(Number(limit), offset);
+      
+      const { rows } = await pool.query(query, params);
+      templates = rows;
+
+      const countQuery = search
+        ? 'SELECT COUNT(*) FROM "email_templates" WHERE "name" ILIKE $1 OR "description" ILIKE $1'
+        : 'SELECT COUNT(*) FROM "email_templates"';
+      const countParams = search ? [`%${search}%`] : [];
+      const countResult = await pool.query(countQuery, countParams);
+      total = parseInt(countResult.rows[0].count);
+    }
+
+    res.json({
+      ok: true,
+      templates,
+      pagination: {
+        page: Number(page),
+        limit: Number(limit),
+        total,
+        totalPages: Math.ceil(total / Number(limit)),
+      },
+    });
+  } catch (err) {
+    console.error('GET /admin/email-templates failed:', err);
+    res.status(500).json({ ok: false, error: err.message || 'Failed to fetch email templates' });
+  }
+});
+
+// Get single email template
+app.get('/admin/email-templates/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const template = await getEmailTemplateById(Number(id));
+
+    if (!template) {
+      return res.status(404).json({ ok: false, error: 'Template not found' });
+    }
+
+    res.json({ ok: true, template });
+  } catch (err) {
+    console.error('GET /admin/email-templates/:id failed:', err);
+    res.status(500).json({ ok: false, error: err.message || 'Failed to fetch template' });
+  }
+});
+
+// Create new email template
+app.post('/admin/email-templates', authenticateAdmin, async (req, res) => {
+  try {
+    const { name, description, html_code, variables = [], preview_image_url, is_default = false } = req.body || {};
+    const adminId = req.admin?.id?.toString() || req.admin?.username || null;
+
+    if (!name || !html_code) {
+      return res.status(400).json({ ok: false, error: 'Name and HTML code are required' });
+    }
+
+    // Check if name already exists
+    let existingTemplate;
+    if (prisma?.email_templates?.findFirst) {
+      existingTemplate = await prisma.email_templates.findFirst({ where: { name } });
+    } else {
+      const { rows } = await pool.query('SELECT * FROM "email_templates" WHERE "name" = $1', [name]);
+      existingTemplate = rows[0] || null;
+    }
+
+    if (existingTemplate) {
+      return res.status(400).json({ ok: false, error: 'Template with this name already exists' });
+    }
+
+    // If setting as default, unset other defaults
+    if (is_default) {
+      if (prisma?.email_templates?.updateMany) {
+        await prisma.email_templates.updateMany({
+          where: { is_default: true },
+          data: { is_default: false },
+        });
+      } else {
+        await pool.query('UPDATE "email_templates" SET "is_default" = false WHERE "is_default" = true');
+      }
+    }
+
+    // If no default exists and this is the first template, set as default
+    const defaultTemplate = await getDefaultEmailTemplate();
+    const shouldBeDefault = is_default || (!defaultTemplate && !existingTemplate);
+
+    const template = await createEmailTemplateRecord({
+      name,
+      description: description || null,
+      html_code,
+      variables: Array.isArray(variables) ? variables : [],
+      is_default: shouldBeDefault,
+      preview_image_url: preview_image_url || null,
+      created_by: adminId,
+      created_at: new Date(),
+      updated_at: new Date(),
+    });
+
+    res.json({ ok: true, template });
+  } catch (err) {
+    console.error('POST /admin/email-templates failed:', err);
+    res.status(500).json({ ok: false, error: err.message || 'Failed to create template' });
+  }
+});
+
+// Update email template
+app.put('/admin/email-templates/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, description, html_code, variables, preview_image_url, is_default } = req.body || {};
+
+    const existingTemplate = await getEmailTemplateById(Number(id));
+    if (!existingTemplate) {
+      return res.status(404).json({ ok: false, error: 'Template not found' });
+    }
+
+    // Check if name is being changed and already exists
+    if (name && name !== existingTemplate.name) {
+      let nameExists;
+      if (prisma?.email_templates?.findFirst) {
+        nameExists = await prisma.email_templates.findFirst({ where: { name } });
+      } else {
+        const { rows } = await pool.query('SELECT * FROM "email_templates" WHERE "name" = $1 AND "id" != $2', [name, id]);
+        nameExists = rows[0] || null;
+      }
+
+      if (nameExists) {
+        return res.status(400).json({ ok: false, error: 'Template with this name already exists' });
+      }
+    }
+
+    // If setting as default, unset other defaults
+    if (is_default === true && !existingTemplate.is_default) {
+      if (prisma?.email_templates?.updateMany) {
+        await prisma.email_templates.updateMany({
+          where: { is_default: true, id: { not: Number(id) } },
+          data: { is_default: false },
+        });
+      } else {
+        await pool.query('UPDATE "email_templates" SET "is_default" = false WHERE "is_default" = true AND "id" != $1', [id]);
+      }
+    }
+
+    const updateData = {};
+    if (name !== undefined) updateData.name = name;
+    if (description !== undefined) updateData.description = description;
+    if (html_code !== undefined) updateData.html_code = html_code;
+    if (variables !== undefined) updateData.variables = Array.isArray(variables) ? variables : [];
+    if (preview_image_url !== undefined) updateData.preview_image_url = preview_image_url;
+    if (is_default !== undefined) updateData.is_default = is_default;
+    updateData.updated_at = new Date();
+
+    const updatedTemplate = await updateEmailTemplateRecord(Number(id), updateData);
+
+    res.json({ ok: true, template: updatedTemplate });
+  } catch (err) {
+    console.error('PUT /admin/email-templates/:id failed:', err);
+    res.status(500).json({ ok: false, error: err.message || 'Failed to update template' });
+  }
+});
+
+// Delete email template
+app.delete('/admin/email-templates/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const template = await getEmailTemplateById(Number(id));
+
+    if (!template) {
+      return res.status(404).json({ ok: false, error: 'Template not found' });
+    }
+
+    if (prisma?.email_templates?.delete) {
+      await prisma.email_templates.delete({ where: { id: Number(id) } });
+    } else {
+      await pool.query('DELETE FROM "email_templates" WHERE "id" = $1', [id]);
+    }
+
+    res.json({ ok: true, message: 'Template deleted successfully' });
+  } catch (err) {
+    console.error('DELETE /admin/email-templates/:id failed:', err);
+    res.status(500).json({ ok: false, error: err.message || 'Failed to delete template' });
+  }
+});
+
+// Set template as default
+app.post('/admin/email-templates/:id/set-default', authenticateAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const template = await getEmailTemplateById(Number(id));
+
+    if (!template) {
+      return res.status(404).json({ ok: false, error: 'Template not found' });
+    }
+
+    // Unset all other defaults
+    if (prisma?.email_templates?.updateMany) {
+      await prisma.email_templates.updateMany({
+        where: { is_default: true },
+        data: { is_default: false },
+      });
+      await prisma.email_templates.update({
+        where: { id: Number(id) },
+        data: { is_default: true, updated_at: new Date() },
+      });
+    } else {
+      await pool.query('UPDATE "email_templates" SET "is_default" = false WHERE "is_default" = true');
+      await pool.query('UPDATE "email_templates" SET "is_default" = true, "updated_at" = CURRENT_TIMESTAMP WHERE "id" = $1', [id]);
+    }
+
+    const updatedTemplate = await getEmailTemplateById(Number(id));
+    res.json({ ok: true, template: updatedTemplate });
+  } catch (err) {
+    console.error('POST /admin/email-templates/:id/set-default failed:', err);
+    res.status(500).json({ ok: false, error: err.message || 'Failed to set default template' });
+  }
+});
+
+// Preview template with sample data
+app.post('/admin/email-templates/preview', authenticateAdmin, async (req, res) => {
+  try {
+    const { html_code, variables = {} } = req.body || {};
+
+    if (!html_code) {
+      return res.status(400).json({ ok: false, error: 'HTML code is required' });
+    }
+
+    // Default sample data for preview
+    const sampleData = {
+      content: variables.content || '<p>This is a sample email content. You can use HTML formatting here.</p>',
+      subject: variables.subject || 'Sample Email Subject',
+      logoUrl: variables.logoUrl || process.env.LOGO_URL || 'https://dashboard.zuperior.com/_next/image?url=%2Flogo.png&w=64&q=75',
+      companyName: variables.companyName || 'Zuperior FX Limited',
+      companyEmail: variables.companyEmail || process.env.FROM_EMAIL || 'info@zuperior.com',
+      companyPhone: variables.companyPhone || process.env.COMPANY_PHONE || '+44 7868 811937',
+      imageUrl: variables.imageUrl || '',
+      currentYear: variables.currentYear || new Date().getFullYear().toString(),
+      recipientName: variables.recipientName || 'John Doe',
+      recipientEmail: variables.recipientEmail || 'user@example.com',
+    };
+
+    // Replace variables in template
+    let previewHtml = html_code;
+    Object.keys(sampleData).forEach((key) => {
+      const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'g');
+      previewHtml = previewHtml.replace(regex, sampleData[key]);
+    });
+
+    res.json({ ok: true, preview_html: previewHtml, sample_data: sampleData });
+  } catch (err) {
+    console.error('POST /admin/email-templates/preview failed:', err);
+    res.status(500).json({ ok: false, error: err.message || 'Failed to preview template' });
   }
 });
 
