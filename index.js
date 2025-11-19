@@ -2718,8 +2718,34 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
       `;
     };
 
+    // Helper function to get recipient name with fallback
+    const getRecipientName = (user) => {
+      // Use actual user name if available
+      if (user.name && user.name.trim()) {
+        return user.name.trim();
+      }
+      
+      // Fallback: Extract name from email (part before @)
+      if (user.email) {
+        const emailPart = user.email.split('@')[0];
+        // Capitalize first letter and replace dots/underscores with spaces
+        const formattedName = emailPart
+          .replace(/[._-]/g, ' ')
+          .split(' ')
+          .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+          .join(' ');
+        return formattedName;
+      }
+      
+      // Final fallback
+      return 'Valued Customer';
+    };
+
     // Function to get template HTML for a user
     const getTemplateHtml = (user) => {
+      // Get the actual recipient name
+      const recipientName = getRecipientName(user);
+      
       // If a template is selected, use the template's HTML code directly
       if (selectedTemplate && selectedTemplate.html_code) {
         // Check if body is already a full HTML document (from preview)
@@ -2737,7 +2763,7 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
           
           // Only replace user-specific variables that might not have been replaced in preview
           const userVariables = {
-            recipientName: user.name || '',
+            recipientName: recipientName,
             recipientEmail: user.email || '',
           };
           
@@ -2762,7 +2788,7 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
           companyPhone: process.env.COMPANY_PHONE || '+44 7868 811937',
           imageUrl: imageUrl || '',
           currentYear: new Date().getFullYear().toString(),
-          recipientName: user.name || '',
+          recipientName: recipientName,
           recipientEmail: user.email || '',
         };
         
@@ -2776,7 +2802,7 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
       }
       
       // Otherwise, use the default template function which wraps body in template structure
-      return emailTemplate(body, imageUrl, finalSubject || subject, null, user.name, user.email);
+      return emailTemplate(body, imageUrl, finalSubject || subject, null, recipientName, user.email);
     };
 
     // Send emails with error handling using external API
@@ -2787,6 +2813,9 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
     for (const user of users) {
       let emailRecord = null;
       try {
+        // Get the actual recipient name
+        const recipientName = getRecipientName(user);
+        
         // Get template HTML for this user
         const userTemplateHtml = getTemplateHtml(user);
         const userContentBody = finalIsHtml ? userTemplateHtml : body;
@@ -2799,7 +2828,7 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
         // Create email record in database with pending status
         emailRecord = await createSentEmailRecord({
           recipient_email: user.email,
-          recipient_name: user.name || null,
+          recipient_name: recipientName,
           subject: finalSubject || 'Email',
           content_body: userContentBody,
           is_html: finalIsHtml,
@@ -2925,13 +2954,15 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
 
         // Update email record with success status
         // If we got here, the API call completed (no network error)
-        // Since emails are being sent successfully, we mark it as sent
-        // Accept any status code as long as we got a response (emails are being sent)
-        if (apiResponse) {
+        // Since the user confirmed emails are being sent successfully,
+        // we mark as "sent" if we got ANY response (emails are going through)
+        const isSuccess = apiResponse && apiResponse.status !== undefined;
+
+        if (isSuccess) {
           try {
             const perRecipientSentAt = new Date();
 
-            // Update database record
+            // ALWAYS update database record to "sent" status when email is successfully sent
             await updateSentEmailRecord(emailRecord.id, {
               status: 'sent',
               sent_at: perRecipientSentAt,
@@ -2942,54 +2973,39 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
             successCount++;
             results.push({
               email: user.email,
-              name: user.name || null,
+              name: recipientName,
               status: 'success',
               sentAt: perRecipientSentAt.toISOString(),
             });
             console.log(
-              `[Email API] ✅ Email successfully sent and recorded for ${user.email} - Status: ${apiResponse.status}`
+              `[Email API] ✅ Email successfully sent and status updated to "sent" for ${user.email} - API Status: ${apiResponse.status}`
             );
           } catch (dbError) {
             // Database update failed, but email was sent - still count as success
-            console.error(`[Email API] ⚠️ Database update failed for ${user.email}, but email was sent:`, dbError);
-            successCount++;
-            results.push({ email: user.email, status: 'success', warning: 'Database update failed but email sent' });
-          }
-        } else {
-          // This should never happen due to validateStatus, but just in case
-          console.warn(`[Email API] ⚠️ Unexpected response status: ${apiResponse?.status}`);
-          // Still mark as sent if status is 2xx (defensive coding)
-          if (apiResponse?.status >= 200 && apiResponse?.status < 300) {
+            // Try to update again with retry
+            console.error(`[Email API] ⚠️ Database update failed for ${user.email}, retrying...`, dbError);
             try {
-              const perRecipientSentAt = new Date();
+              const retrySentAt = new Date();
               await updateSentEmailRecord(emailRecord.id, {
                 status: 'sent',
-                sent_at: perRecipientSentAt,
-                updated_at: perRecipientSentAt,
+                sent_at: retrySentAt,
+                updated_at: retrySentAt,
               });
-              successCount++;
-              results.push({
-                email: user.email,
-                name: user.name || null,
-                status: 'success',
-                sentAt: perRecipientSentAt.toISOString(),
-              });
-            } catch (dbError) {
-              console.error(
-                `[Email API] ⚠️ Database update failed for ${user.email}:`,
-                dbError
-              );
-              successCount++;
-              results.push({
-                email: user.email,
-                name: user.name || null,
-                status: 'success',
-                sentAt: new Date().toISOString(),
-              });
+              console.log(`[Email API] ✅ Retry successful - status updated to "sent" for ${user.email}`);
+            } catch (retryError) {
+              console.error(`[Email API] ❌ Retry also failed for ${user.email}:`, retryError);
             }
-          } else {
-            throw new Error(`API returned unexpected status: ${apiResponse?.status || 'unknown'}`);
+            successCount++;
+            results.push({ 
+              email: user.email, 
+              name: recipientName,
+              status: 'success', 
+              warning: 'Database update failed but email sent' 
+            });
           }
+        } else {
+          // Not a success response - this should be caught by error handling above
+          throw new Error(`API returned non-success status: ${apiResponse?.status || 'unknown'}`);
         }
       } catch (error) {
         failureCount++;
@@ -3040,10 +3056,11 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
         } else {
           // If record creation failed, try to create a failed record
           try {
+            const failedRecipientName = getRecipientName(user);
             const failedUserContentBody = getTemplateHtml(user);
             await createSentEmailRecord({
               recipient_email: user.email,
-              recipient_name: user.name || null,
+              recipient_name: failedRecipientName,
               subject: finalSubject || 'Email',
               content_body: finalIsHtml ? failedUserContentBody : body,
               is_html: finalIsHtml,
@@ -3060,9 +3077,11 @@ app.post('/admin/send-emails', authenticateAdmin, async (req, res) => {
           }
         }
 
+        // Get recipient name for error result (in case it wasn't set in try block)
+        const errorRecipientName = getRecipientName(user);
         results.push({
           email: user.email,
-          name: user.name || null,
+          name: errorRecipientName,
           status: 'failed',
           error: errorMessage,
           sentAt: new Date().toISOString(),
