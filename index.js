@@ -5893,33 +5893,87 @@ app.get('/admin/group-management', authenticateAdmin, async (req, res) => {
     const { page = 1, limit = 50, search, is_active } = req.query;
     const skip = (Number(page) - 1) * Number(limit);
     
-    const where = {};
+    // Build WHERE clause for SQL
+    const whereConditions = [];
+    const params = [];
+    let paramIndex = 1;
+    
     if (search) {
-      where.OR = [
-        { group: { contains: String(search), mode: 'insensitive' } },
-        { company: { contains: String(search), mode: 'insensitive' } },
-      ];
-    }
-    if (is_active !== undefined) {
-      where.is_active = is_active === 'true';
+      whereConditions.push(`("group" ILIKE $${paramIndex} OR "company" ILIKE $${paramIndex})`);
+      params.push(`%${String(search)}%`);
+      paramIndex++;
     }
     
-    const [items, total] = await Promise.all([
-      prisma.group_management.findMany({
-        where,
-        skip,
-        take: Number(limit),
-        orderBy: { created_at: 'desc' },
-      }),
-      prisma.group_management.count({ where }),
-    ]);
+    if (is_active !== undefined) {
+      whereConditions.push(`"is_active" = $${paramIndex}`);
+      params.push(is_active === 'true');
+      paramIndex++;
+    }
+    
+    const whereClause = whereConditions.length > 0 
+      ? `WHERE ${whereConditions.join(' AND ')}`
+      : '';
+    
+    // Try Prisma first, fallback to raw SQL on error
+    let items, total;
+    
+    try {
+      if (prisma?.group_management?.findMany) {
+        const where = {};
+        if (search) {
+          where.OR = [
+            { group: { contains: String(search), mode: 'insensitive' } },
+            { company: { contains: String(search), mode: 'insensitive' } },
+          ];
+        }
+        if (is_active !== undefined) {
+          where.is_active = is_active === 'true';
+        }
+        
+        [items, total] = await Promise.all([
+          prisma.group_management.findMany({
+            where,
+            skip,
+            take: Number(limit),
+            orderBy: { created_at: 'desc' },
+          }),
+          prisma.group_management.count({ where }),
+        ]);
+      } else {
+        throw new Error('Prisma model not available');
+      }
+    } catch (prismaError) {
+      // Fallback to raw SQL if Prisma fails
+      console.log('[Group Management] Using SQL fallback:', prismaError.message);
+      const itemsQuery = `
+        SELECT * FROM "group_management"
+        ${whereClause}
+        ORDER BY "created_at" DESC
+        LIMIT $${paramIndex} OFFSET $${paramIndex + 1}
+      `;
+      const countQuery = `
+        SELECT COUNT(*) as count FROM "group_management"
+        ${whereClause}
+      `;
+      
+      const itemsParams = [...params, Number(limit), skip];
+      const countParams = params;
+      
+      const [itemsResult, countResult] = await Promise.all([
+        pool.query(itemsQuery, itemsParams),
+        pool.query(countQuery, countParams),
+      ]);
+      
+      items = itemsResult.rows;
+      total = parseInt(countResult.rows[0]?.count || 0, 10);
+    }
     
     res.json({ ok: true, items, total, page: Number(page), limit: Number(limit) });
   } catch (err) {
     console.error('GET /admin/group-management failed:', err);
     const errorMessage = err.message || 'Failed to fetch groups';
-    // Check if it's a Prisma model not found error
-    if (errorMessage.includes('group_management') || errorMessage.includes('does not exist')) {
+    // Check if it's a database table not found error
+    if (errorMessage.includes('group_management') || errorMessage.includes('does not exist') || errorMessage.includes('relation') && errorMessage.includes('does not exist')) {
       res.status(500).json({ 
         ok: false, 
         error: 'Database table not found. Please run: npx prisma generate && npx prisma migrate dev' 
@@ -5965,65 +6019,110 @@ app.post('/admin/group-management/sync', authenticateAdmin, async (req, res) => 
         
         const groupName = String(groupData.Group);
         
-        // Map API response to database fields
+        // Map API response to database fields (only fields that exist in DB)
         const data = {
           group: groupName,
           server: groupData.Server ?? 1,
-          permissions_flags: groupData.PermissionsFlags ?? 0,
           auth_mode: groupData.AuthMode ?? 0,
           auth_password_min: groupData.AuthPasswordMin ?? 8,
-          company: groupData.Company || null,
-          company_page: groupData.CompanyPage || null,
-          company_email: groupData.CompanyEmail || null,
-          company_support_page: groupData.CompanySupportPage || null,
-          company_support_email: groupData.CompanySupportEmail || null,
-          company_catalog: groupData.CompanyCatalog || null,
           currency: groupData.Currency || null,
-          currency_digits: groupData.CurrencyDigits ?? 2,
-          reports_mode: groupData.ReportsMode ?? 1,
-          reports_flags: groupData.ReportsFlags ?? 5,
-          reports_smtp: groupData.ReportsSMTP || null,
-          reports_smtp_login: groupData.ReportsSMTPLogin || null,
-          news_mode: groupData.NewsMode ?? 2,
-          news_category: groupData.NewsCategory || null,
-          mail_mode: groupData.MailMode ?? 1,
-          trade_flags: groupData.TradeFlags ?? 2135,
-          trade_interestrate: groupData.TradeInterestrate ? parseFloat(groupData.TradeInterestrate) : 0,
-          trade_virtual_credit: groupData.TradeVirtualCredit ? parseFloat(groupData.TradeVirtualCredit) : 0,
-          margin_free_mode: groupData.MarginFreeMode ?? 1,
-          margin_so_mode: groupData.MarginSOMode ?? 0,
-          margin_call: groupData.MarginCall ? parseFloat(groupData.MarginCall) : 100,
-          margin_stop_out: groupData.MarginStopOut ? parseFloat(groupData.MarginStopOut) : 5,
-          demo_leverage: groupData.DemoLeverage ?? 100,
-          demo_deposit: groupData.DemoDeposit ? parseFloat(groupData.DemoDeposit) : 0,
-          limit_history: groupData.LimitHistory ?? 0,
-          limit_orders: groupData.LimitOrders ?? 0,
-          limit_symbols: groupData.LimitSymbols ?? 0,
-          limit_positions: groupData.LimitPositions ?? 0,
-          margin_mode: groupData.MarginMode ?? 2,
-          margin_flags: groupData.MarginFlags ?? 0,
-          trade_transfer_mode: groupData.TradeTransferMode ?? 0,
           synced_at: new Date(),
           updated_at: new Date(),
         };
         
+        // Determine account_type from group name
+        let accountType = null;
+        if (groupName.toLowerCase().includes('demo')) {
+          accountType = 'Demo';
+        } else if (groupName.toLowerCase().includes('real')) {
+          accountType = 'Live';
+        }
+        
         // Check if group exists
-        const existing = await prisma.group_management.findUnique({
-          where: { group: groupName },
-        });
+        let existing;
+        try {
+          if (prisma?.group_management?.findUnique) {
+            existing = await prisma.group_management.findUnique({
+              where: { group: groupName },
+            });
+          } else {
+            const { rows } = await pool.query('SELECT * FROM "group_management" WHERE "group" = $1', [groupName]);
+            existing = rows[0] || null;
+          }
+        } catch (findError) {
+          // Fallback to SQL
+          const { rows } = await pool.query('SELECT * FROM "group_management" WHERE "group" = $1', [groupName]);
+          existing = rows[0] || null;
+        }
         
         if (existing) {
-          // Update existing group (preserve is_active status)
-          await prisma.group_management.update({
-            where: { group: groupName },
-            data: { ...data, is_active: existing.is_active }, // Preserve existing is_active
-          });
+          // Update existing group (preserve is_active and dedicated_name status)
+          const updateData = {
+            ...data,
+            is_active: existing.is_active, // Preserve existing is_active
+            dedicated_name: existing.dedicated_name, // Preserve existing dedicated_name
+            account_type: accountType || existing.account_type, // Update account_type if determined
+          };
+          
+          try {
+            if (prisma?.group_management?.update) {
+              await prisma.group_management.update({
+                where: { group: groupName },
+                data: updateData,
+              });
+            } else {
+              throw new Error('Prisma not available');
+            }
+          } catch (updateError) {
+            // Fallback to SQL
+            await pool.query(
+              'UPDATE "group_management" SET "server" = $1, "auth_mode" = $2, "auth_password_min" = $3, "currency" = $4, "account_type" = $5, "synced_at" = $6, "updated_at" = $7 WHERE "group" = $8',
+              [
+                updateData.server,
+                updateData.auth_mode,
+                updateData.auth_password_min,
+                updateData.currency,
+                updateData.account_type,
+                updateData.synced_at,
+                updateData.updated_at,
+                groupName,
+              ]
+            );
+          }
           updated++;
         } else {
           // Create new group
-          await prisma.group_management.create({
-            data: { ...data, is_active: true }, // New groups default to active
-          });
+          const createData = {
+            ...data,
+            is_active: true, // New groups default to active
+            account_type: accountType,
+          };
+          
+          try {
+            if (prisma?.group_management?.create) {
+              await prisma.group_management.create({
+                data: createData,
+              });
+            } else {
+              throw new Error('Prisma not available');
+            }
+          } catch (createError) {
+            // Fallback to SQL
+            await pool.query(
+              'INSERT INTO "group_management" ("group", "server", "auth_mode", "auth_password_min", "currency", "is_active", "account_type", "synced_at", "created_at", "updated_at") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), $9)',
+              [
+                createData.group,
+                createData.server,
+                createData.auth_mode,
+                createData.auth_password_min,
+                createData.currency,
+                createData.is_active,
+                createData.account_type,
+                createData.synced_at,
+                createData.updated_at,
+              ]
+            );
+          }
           created++;
         }
       } catch (err) {
@@ -6058,15 +6157,35 @@ app.put('/admin/group-management/:id/toggle-active', authenticateAdmin, async (r
       return res.status(400).json({ ok: false, error: 'is_active must be a boolean' });
     }
     
-    const group = await prisma.group_management.update({
-      where: { id: Number(id) },
-      data: { is_active, updated_at: new Date() },
-    });
+    let group;
+    try {
+      if (prisma?.group_management?.update) {
+        group = await prisma.group_management.update({
+          where: { id: Number(id) },
+          data: { is_active, updated_at: new Date() },
+        });
+      } else {
+        throw new Error('Prisma not available');
+      }
+    } catch (prismaError) {
+      // Fallback to raw SQL
+      console.log('[Toggle Active] Using SQL fallback:', prismaError.message);
+      const result = await pool.query(
+        'UPDATE "group_management" SET "is_active" = $1, "updated_at" = NOW() WHERE "id" = $2 RETURNING *',
+        [is_active, Number(id)]
+      );
+      
+      if (result.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: 'Group not found' });
+      }
+      
+      group = result.rows[0];
+    }
     
     res.json({ ok: true, group });
   } catch (err) {
     console.error('PUT /admin/group-management/:id/toggle-active failed:', err);
-    res.status(500).json({ ok: false, error: 'Failed to update group status' });
+    res.status(500).json({ ok: false, error: err.message || 'Failed to update group status' });
   }
 });
 
@@ -6074,9 +6193,22 @@ app.put('/admin/group-management/:id/toggle-active', authenticateAdmin, async (r
 app.get('/admin/group-management/:id', authenticateAdmin, async (req, res) => {
   try {
     const { id } = req.params;
-    const group = await prisma.group_management.findUnique({
-      where: { id: Number(id) },
-    });
+    let group;
+    
+    try {
+      if (prisma?.group_management?.findUnique) {
+        group = await prisma.group_management.findUnique({
+          where: { id: Number(id) },
+        });
+      } else {
+        throw new Error('Prisma not available');
+      }
+    } catch (prismaError) {
+      // Fallback to raw SQL
+      console.log('[Get Group] Using SQL fallback:', prismaError.message);
+      const { rows } = await pool.query('SELECT * FROM "group_management" WHERE "id" = $1', [Number(id)]);
+      group = rows[0] || null;
+    }
     
     if (!group) {
       return res.status(404).json({ ok: false, error: 'Group not found' });
@@ -6085,7 +6217,7 @@ app.get('/admin/group-management/:id', authenticateAdmin, async (req, res) => {
     res.json({ ok: true, group });
   } catch (err) {
     console.error('GET /admin/group-management/:id failed:', err);
-    res.status(500).json({ ok: false, error: 'Failed to fetch group' });
+    res.status(500).json({ ok: false, error: err.message || 'Failed to fetch group' });
   }
 });
 
@@ -6105,10 +6237,30 @@ app.put('/admin/group-management/:id/dedicated-name', authenticateAdmin, async (
       updated_at: new Date() 
     };
     
-    const group = await prisma.group_management.update({
-      where: { id: Number(id) },
-      data: updateData,
-    });
+    let group;
+    try {
+      if (prisma?.group_management?.update) {
+        group = await prisma.group_management.update({
+          where: { id: Number(id) },
+          data: updateData,
+        });
+      } else {
+        throw new Error('Prisma not available');
+      }
+    } catch (prismaError) {
+      // Fallback to raw SQL
+      console.log('[Update Dedicated Name] Using SQL fallback:', prismaError.message);
+      const result = await pool.query(
+        'UPDATE "group_management" SET "dedicated_name" = $1, "updated_at" = NOW() WHERE "id" = $2 RETURNING *',
+        [updateData.dedicated_name, Number(id)]
+      );
+      
+      if (result.rows.length === 0) {
+        return res.status(404).json({ ok: false, error: 'Group not found' });
+      }
+      
+      group = result.rows[0];
+    }
     
     res.json({ ok: true, group });
   } catch (err) {
@@ -6116,7 +6268,7 @@ app.put('/admin/group-management/:id/dedicated-name', authenticateAdmin, async (
     const errorMessage = err.message || 'Failed to update dedicated name';
     
     // Check if it's a database column error
-    if (errorMessage.includes('dedicated_name') || errorMessage.includes('Unknown column') || errorMessage.includes('column') && errorMessage.includes('does not exist')) {
+    if (errorMessage.includes('dedicated_name') || errorMessage.includes('Unknown column') || (errorMessage.includes('column') && errorMessage.includes('does not exist'))) {
       res.status(500).json({ 
         ok: false, 
         error: 'Database column not found. Please run: ALTER TABLE "group_management" ADD COLUMN "dedicated_name" VARCHAR(255);' 
